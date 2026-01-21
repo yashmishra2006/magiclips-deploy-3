@@ -14,7 +14,7 @@ import time
 
 def extract_audio(video_path: str) -> str:
     """Extracts audio from video to a temporary mp3 file if it doesn't already exist."""
-    audio_path = video_path + ".mp3"
+    audio_path = "input.mp4.mp3"
     
     # Check if MP3 already exists
     if os.path.exists(audio_path):
@@ -72,12 +72,17 @@ def transcribe_audio(audio_path: str, gcs_uri: str = None) -> dict:
         return None
 
     if gcs_uri:
-        url = f"{whisper_url.rstrip('/')}/transcribe_gcs"
+        # New Whisper endpoint format
+        url = f"{whisper_url.rstrip('/')}/transcribe"
         logger.info(f"Sending GCS URI to Whisper service: {url} | URI: {gcs_uri}")
         try:
-            with httpx.Client(timeout=300.0) as client:
-                # The service expects a JSON body with "gcs_uri"
-                response = client.post(url, json={"gcs_uri": gcs_uri})
+            # Increased timeout for long audio files (15 minutes)
+            with httpx.Client(timeout=900.0) as client:
+                payload = {
+                    "gs_url": gcs_uri,
+                    "delete_after": False
+                }
+                response = client.post(url, json=payload)
                 response.raise_for_status()
                 return response.json()
         except Exception as e:
@@ -113,10 +118,17 @@ def format_transcript(whisper_data: dict) -> str:
     
     return "\n".join(lines)
 
-def analyze_audio_with_gemini(media_path: str, api_key: str = None, num_clips: int = 5, max_duration: int = 30) -> list:
+def analyze_audio_with_gemini(media_path: str, api_key: str = None, num_clips: int = 5, max_duration: int = 30, gcs_audio_uri: str = None) -> list:
     """
     Analyzes the audio/video file using Gemini 1.5 Flash to find viral moments.
     Returns a list of dicts: {'start': 'HH:MM:SS', 'end': 'HH:MM:SS', 'reason': '...'}
+    
+    Args:
+        media_path: Local path to media file
+        api_key: Google API key for Gemini
+        num_clips: Number of viral clips to find
+        max_duration: Max duration per clip in seconds
+        gcs_audio_uri: Optional GCS URI (gs://...) of extracted audio to use for Whisper transcription
     """
     
     if not api_key:
@@ -136,9 +148,9 @@ def analyze_audio_with_gemini(media_path: str, api_key: str = None, num_clips: i
     temp_audio_path = None
     upload_path = media_path
     
-    # Attempt audio extraction to save bandwidth/processing
-    if media_path.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
-        logger.info("Extracting audio for faster analysis...")
+    # Attempt audio extraction to save bandwidth/processing (only if no GCS URI provided)
+    if not gcs_audio_uri and media_path.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
+        logger.info("Extracting audio for fa    ster analysis...")
         extracted = extract_audio(media_path)
         if extracted != media_path:
             upload_path = extracted
@@ -146,14 +158,22 @@ def analyze_audio_with_gemini(media_path: str, api_key: str = None, num_clips: i
 
     # Try to transcribe with Whisper first
     transcript_text = ""
-    # Check for GCS URI override for testing/optimization
-    test_gcs_uri = os.getenv("TEST_GCS_URI")
     
-    if test_gcs_uri or temp_audio_path or media_path.lower().endswith(('.mp3', '.wav', '.m4a')):
-        audio_source = temp_audio_path if temp_audio_path else media_path
-        logger.info(f"Attempting to transcribe. GCS: {bool(test_gcs_uri)}, Local: {audio_source}")
+    if gcs_audio_uri:
+        # Use provided GCS audio URI for transcription
+        logger.info(f"Using GCS audio URI for Whisper: {gcs_audio_uri}")
+        whisper_data = transcribe_audio(None, gcs_uri=gcs_audio_uri)
         
-        whisper_data = transcribe_audio(audio_source, gcs_uri=test_gcs_uri)
+        if whisper_data:
+            transcript_text = format_transcript(whisper_data)
+            logger.info(f"Transcription successful. Length: {len(transcript_text)} chars")
+        else:
+            logger.warning("Transcription failed or returned no data.")
+    elif temp_audio_path or media_path.lower().endswith(('.mp3', '.wav', '.m4a')):
+        audio_source = temp_audio_path if temp_audio_path else media_path
+        logger.info(f"Attempting to transcribe from local file: {audio_source}")
+        
+        whisper_data = transcribe_audio(audio_source)
         
         if whisper_data:
             transcript_text = format_transcript(whisper_data)
@@ -162,21 +182,6 @@ def analyze_audio_with_gemini(media_path: str, api_key: str = None, num_clips: i
             logger.warning("Transcription failed or returned no data.")
 
     try:
-        logger.info(f"Uploading file to Gemini: {upload_path}")
-        # Upload the file to Gemini
-        video_file = genai.upload_file(path=upload_path)
-        logger.info("Upload complete. Waiting for processing...")
-        
-        # Wait for processing (usually fast for audio/small video)
-        while video_file.state.name == "PROCESSING":
-            logger.info("Waiting for file processing...")
-            time.sleep(2)
-            video_file = genai.get_file(video_file.name)
-
-        if video_file.state.name == "FAILED":
-            raise ValueError("Gemini file processing failed.")
-
-        logger.info("File processed. Generating content...")
 
         # Create the model - Using Gemini 1.5 Pro for best video understanding
         model = genai.GenerativeModel(model_name="gemini-3-pro-preview")
@@ -261,12 +266,9 @@ def analyze_audio_with_gemini(media_path: str, api_key: str = None, num_clips: i
             MAXIMUM {num_clips} CLIPS ONLY. Use REAL timestamps from the audio content.
             """
 
-        response = model.generate_content([video_file, prompt], generation_config={"response_mime_type": "application/json"})
+        response = model.generate_content([prompt], generation_config={"response_mime_type": "application/json"})
         
         logger.info(f"Gemini response: {response.text}")
-        
-        # Clean up the file from Gemini storage
-        video_file.delete()
         
         try:
             # Robust JSON extraction
@@ -344,12 +346,6 @@ def analyze_audio_with_gemini(media_path: str, api_key: str = None, num_clips: i
         logger.error(f"Error in Gemini analysis: {e}")
         raise e
     finally:
-        # Cleanup Gemini file
-        try:
-            if 'video_file' in locals():
-                video_file.delete()
-        except:
-            pass
         # Cleanup local temp audio
         try:
             # if temp_audio_path and os.path.exists(temp_audio_path):

@@ -47,8 +47,24 @@ except Exception as e:
 
 
 # ============================================================
-# UTIL: TIME PARSER
+# UTIL: TIME PARSER & VIDEO INFO
 # ============================================================
+
+def get_video_duration(video_path: str) -> float:
+    """Get video duration in seconds using OpenCV."""
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return 0.0
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        cap.release()
+        if fps > 0:
+            return frame_count / fps
+        return 0.0
+    except Exception as e:
+        logger.error(f"Error getting video duration: {e}")
+        return 0.0
 
 def srt_time_to_seconds(time_str) -> float:
     """Converts HH:MM:SS / MM:SS / seconds to float."""

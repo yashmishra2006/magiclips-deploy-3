@@ -1,6 +1,11 @@
 # Core numerical
 numpy
 
+# PyTorch CPU-only (install before ultralytics to avoid CUDA)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+
 # Computer vision (CPU-only, lightweight)
 opencv-python-headless
 
@@ -31,4 +36,5 @@ google-auth
 google-auth-oauthlib
 google-auth-httplib2
 
+# YOLO (will use CPU torch from above)
 ultralytics
