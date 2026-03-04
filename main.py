@@ -217,25 +217,98 @@ async def download_from_gcs(gs_uri: str, suffix: str = ".mp4") -> Path:
         raise HTTPException(status_code=500, detail=f"GCS download failed: {e}")
 
 def extract_audio_sync(video_path: str, audio_path: str) -> str:
-    """Extract audio from video using ffmpeg (synchronous)."""
+    """Robustly extract audio from video using ffmpeg, with fallbacks for Whisper input.
+    
+    Key insight: videos may have multiple audio streams where secondary streams are
+    corrupted/non-standard. We explicitly select only the first audio stream (-map 0:a:0)
+    to avoid decoding errors from bad secondary streams. FFmpeg exits 0 even on non-fatal
+    AAC errors, so we also check stderr for critical errors.
+    """
     import subprocess
-    try:
-        cmd = [
-            'ffmpeg', '-y',
-            '-i', video_path,
-            '-vn',  # No video
-            '-acodec', 'libmp3lame',
-            '-q:a', '4',
-            audio_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode != 0:
-            raise Exception(f"FFmpeg failed: {result.stderr}")
+    import logging
+    logger = logging.getLogger("capsai.audio")
+    base_path = audio_path.rsplit('.', 1)[0]
+
+    def run_ffmpeg(cmd: list, label: str) -> tuple[int, str]:
+        """Run ffmpeg command and return (returncode, stderr)."""
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if result.returncode != 0:
+                logger.warning(f"[{label}] FFmpeg exited {result.returncode}: {result.stderr[-500:]}")
+            else:
+                # Log any warnings even on success
+                if result.stderr:
+                    logger.debug(f"[{label}] FFmpeg warnings: {result.stderr[-300:]}")
+            return result.returncode, result.stderr
+        except subprocess.TimeoutExpired:
+            logger.error(f"[{label}] FFmpeg timed out")
+            return -1, "timeout"
+        except Exception as e:
+            logger.error(f"[{label}] Exception: {e}")
+            return -1, str(e)
+
+    # --- Attempt 1: MP3, first audio stream only (avoids corrupt secondary streams) ---
+    returncode, _ = run_ffmpeg([
+        'ffmpeg', '-y', '-i', video_path,
+        '-map', '0:a:0',          # Explicitly pick only the first audio stream
+        '-vn', '-acodec', 'libmp3lame', '-q:a', '4',
+        '-ar', '16000',           # Resample to 16kHz - ideal for Whisper
+        '-ac', '1',               # Mono - reduces file size, fine for speech
+        audio_path
+    ], "mp3-stream0")
+    if returncode == 0:
+        logger.info(f"Audio extracted (mp3, stream 0): {audio_path}")
         return audio_path
-    except Exception as e:
-        logger = logging.getLogger("capsai.audio")
-        logger.error(f"Audio extraction failed: {e}")
-        raise
+
+    # --- Attempt 2: WAV, first audio stream only ---
+    audio_path_wav = base_path + '_s0.wav'
+    returncode, _ = run_ffmpeg([
+        'ffmpeg', '-y', '-i', video_path,
+        '-map', '0:a:0',
+        '-vn', '-acodec', 'pcm_s16le',
+        '-ar', '16000', '-ac', '1',
+        audio_path_wav
+    ], "wav-stream0")
+    if returncode == 0:
+        logger.info(f"Audio extracted (wav, stream 0): {audio_path_wav}")
+        return audio_path_wav
+
+    # --- Attempt 3: MP3, no stream mapping (let FFmpeg decide), best audio stream ---
+    returncode, _ = run_ffmpeg([
+        'ffmpeg', '-y', '-i', video_path,
+        '-vn', '-acodec', 'libmp3lame', '-q:a', '4',
+        '-ar', '16000', '-ac', '1',
+        audio_path
+    ], "mp3-auto")
+    if returncode == 0:
+        logger.info(f"Audio extracted (mp3, auto stream): {audio_path}")
+        return audio_path
+
+    # --- Attempt 4: WAV, no stream mapping ---
+    audio_path_wav2 = base_path + '_auto.wav'
+    returncode, _ = run_ffmpeg([
+        'ffmpeg', '-y', '-i', video_path,
+        '-vn', '-acodec', 'pcm_s16le',
+        '-ar', '16000', '-ac', '1',
+        audio_path_wav2
+    ], "wav-auto")
+    if returncode == 0:
+        logger.info(f"Audio extracted (wav, auto stream): {audio_path_wav2}")
+        return audio_path_wav2
+
+    # --- Attempt 5: Direct stream copy (AAC), first stream only ---
+    audio_path_aac = base_path + '_s0.aac'
+    returncode, _ = run_ffmpeg([
+        'ffmpeg', '-y', '-i', video_path,
+        '-map', '0:a:0',
+        '-vn', '-acodec', 'copy',
+        audio_path_aac
+    ], "aac-copy-stream0")
+    if returncode == 0:
+        logger.info(f"Audio extracted (aac copy, stream 0): {audio_path_aac}")
+        return audio_path_aac
+
+    raise Exception("All audio extraction methods failed. Check logs for details.")
     
 # ==========================================
 # VIRAL CLIPS GENERATION ENDPOINT (NEW)
@@ -429,7 +502,7 @@ async def process_viral_clips_worker(
 
 # @app.post("/api/generate-viral-clips")
 # async def generate_viral_clips(
-#     request: ViralClipRequest,
+#     request: ViralClipRequest,a
 #     user=Depends(verify_firebase_token)
 # ):
 #     uid = user["uid"]

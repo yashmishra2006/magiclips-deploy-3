@@ -1,5 +1,5 @@
 # Use Python 3.11 slim image as base
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 # Install system dependencies for video processing and OpenCV
 RUN apt-get update && \

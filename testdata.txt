@@ -20,4 +20,4 @@ yash@yashmishra:/media/yash/Drive/Users/yash4/Desktop/magiclips deploy$
 python get_firebase_token.py --create test@example.com testpassword123
 
 # Get token for existing user
-python get_firebase_token.py test@example.com testpassword123
+python get_firebase_token.py test@example.com testpassword

@@ -1,40 +1,64 @@
-# Core numerical
+# --------------------------------------------------------
+# CORE NUMERICAL
+# --------------------------------------------------------
 numpy
 
-# PyTorch CPU-only (install before ultralytics to avoid CUDA)
+# --------------------------------------------------------
+# PYTORCH CPU-ONLY (must be ABOVE ultralytics)
+# --------------------------------------------------------
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
 torchvision
+torchaudio
 
-# Computer vision (CPU-only, lightweight)
-opencv-python-headless
+# --------------------------------------------------------
+# COMPUTER VISION
+# --------------------------------------------------------
+opencv-python-headless          # lightweight, no GUI
+mediapipe                       # emotion/landmark detection
+easyocr                         # OCR for text regions
+Pillow                          # required for CLIP transforms
 
-# MediaPipe (CPU by default)
-mediapipe
+# --------------------------------------------------------
+# YOLO / DETECTION
+# --------------------------------------------------------
+ultralytics                     # YOLOv8 / YOLO-N / face detector
 
-# Video/audio
-yt-dlp
+# --------------------------------------------------------
+# SCENE RECOGNITION (CLIP)
+# --------------------------------------------------------
+open-clip-torch                 # CLIP for scene classification
+
+# --------------------------------------------------------
+# VIDEO / AUDIO
+# --------------------------------------------------------
 ffmpeg-python
+yt-dlp
 
-# Web backend
+# --------------------------------------------------------
+# WEB BACKEND
+# --------------------------------------------------------
 fastapi
 uvicorn
 python-multipart
 python-dotenv
 httpx
 
-# ML (CPU-only)
+# --------------------------------------------------------
+# ML / CPU
+# --------------------------------------------------------
 scikit-learn
 
+# --------------------------------------------------------
 # AI / LLM
+# --------------------------------------------------------
 google-generativeai>=0.8.3
 
-# Cloud / Firebase
+# --------------------------------------------------------
+# CLOUD / FIREBASE
+# --------------------------------------------------------
 google-cloud-storage
 firebase-admin
 google-auth
 google-auth-oauthlib
 google-auth-httplib2
-
-# YOLO (will use CPU torch from above)
-ultralytics

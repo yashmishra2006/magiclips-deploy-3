@@ -1,0 +1,21 @@
+nohup: ignoring input
+/home/yash/Desktop/magiclips deploy/gemini_analysis.py:1: FutureWarning: 
+
+All support for the `google.generativeai` package has ended. It will no longer be receiving 
+updates or bug fixes. Please switch to the `google.genai` package as soon as possible.
+See README for more details:
+
+https://github.com/google-gemini/deprecated-generative-ai-python/blob/main/README.md
+
+  import google.generativeai as genai
+INFO:video_processing:Using CPU processing
+INFO:video_processing:Loaded YOLO face model: yolov12n-face.pt
+INFO:capsai.main:Firebase initialized successfully
+INFO:     Started server process [58548]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [58548]
