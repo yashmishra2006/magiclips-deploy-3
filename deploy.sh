@@ -55,7 +55,7 @@ gcloud run deploy ${SERVICE_NAME} \
   --min-instances 0 \
   --no-traffic --tag "${TAG_NAME:-v2}" \
   "${EXTRA_FLAGS[@]}" \
-  --update-env-vars "GCP_PROJECT_ID=${PROJECT_ID},FIREBASE_PROJECT_ID=caps-85254,GCP_BUCKET_NAME=subtitlegen-input,ALLOWED_INPUT_BUCKETS=subtitlegen-input,CLIP_TOPIC=clip-processing-jobs,YOUTUBE_DOWNLOADER_BUCKET=subtitlegen-input,YOUTUBE_DOWNLOADER_PREFIX=youtube_downloads/"
+  --update-env-vars "GCP_PROJECT_ID=${PROJECT_ID},FIREBASE_PROJECT_ID=caps-85254,GCP_BUCKET_NAME=subtitlegen-input,ALLOWED_INPUT_BUCKETS=subtitlegen-input,CLIP_TOPIC=clip-processing-jobs,YOUTUBE_DOWNLOADER_BUCKET=subtitlegen-input,YOUTUBE_DOWNLOADER_PREFIX=youtube_downloads/,WHISPER_SERVICE_URL=https://v2---magi-clips-whisper-transcription-627061442405.asia-southeast1.run.app"
 # Also set (not hard-coded here): WHISPER_SERVICE_URL=https://<whisper service>.run.app,
 # YOUTUBE_DOWNLOADER_URL=https://<downloader host>/download (HTTPS; see SEC-11 note).
 
