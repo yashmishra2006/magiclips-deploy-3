@@ -9,3 +9,6 @@ __pycache__/
 tmp_uploads/
 
 .env
+
+# Service-account key: kept on disk for manual gcloud deploys, never in git (GitHub push protection).
+new-backend-475414-228aab3a465a.json
