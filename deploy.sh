@@ -53,7 +53,7 @@ gcloud run deploy ${SERVICE_NAME} \
   --concurrency 1 \
   --max-instances 3 \
   --min-instances 0 \
-  --no-allow-unauthenticated \
+  --no-traffic --tag "${TAG_NAME:-v2}" \
   "${EXTRA_FLAGS[@]}" \
   --update-env-vars "GCP_PROJECT_ID=${PROJECT_ID},FIREBASE_PROJECT_ID=caps-85254,GCP_BUCKET_NAME=subtitlegen-input,ALLOWED_INPUT_BUCKETS=subtitlegen-input,CLIP_TOPIC=clip-processing-jobs,YOUTUBE_DOWNLOADER_BUCKET=subtitlegen-input,YOUTUBE_DOWNLOADER_PREFIX=youtube_downloads/"
 # Also set (not hard-coded here): WHISPER_SERVICE_URL=https://<whisper service>.run.app,
@@ -65,3 +65,12 @@ gcloud run services describe ${SERVICE_NAME} \
   --region ${REGION} \
   --project=${PROJECT_ID} \
   --format='value(status.url)'
+
+# ---------------------------------------------------------------------------
+# New revisions go out WITHOUT production traffic, reachable only through the
+# tag URL (https://${TAG_NAME:-v2}---<service>-627061442405.asia-southeast1.run.app).
+# Auth is service-wide, so this script never flips it. After callers use the
+# tag URL with ID tokens, make the service IAM-only:
+#   gcloud run services remove-iam-policy-binding ${SERVICE_NAME} --region ${REGION} \
+#     --member=allUsers --role=roles/run.invoker
+# ---------------------------------------------------------------------------
