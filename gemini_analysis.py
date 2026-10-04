@@ -1,9 +1,10 @@
-import google.generativeai as genai
+from google import genai
 import os
 import json
 import logging
 import re
 import httpx
+from internal_auth import internal_auth_headers
 from typing import Any, Dict, List, Optional
 
 # Configure logging
@@ -13,7 +14,13 @@ logger = logging.getLogger(__name__)
 import ffmpeg
 import time
 
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
+# Vertex AI Configuration (Enterprise)
+_GCP_SA_KEY = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "new-backend-475414-228aab3a465a.json")
+if os.path.exists(_GCP_SA_KEY):
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = _GCP_SA_KEY
+VERTEX_PROJECT = os.getenv("GCP_PROJECT_ID", "new-backend-475414")
+VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
 TRANSCRIPT_CHUNK_MAX_CHARS = int(os.getenv("TRANSCRIPT_CHUNK_MAX_CHARS", "12000"))
 TRANSCRIPT_CHUNK_OVERLAP_SEGMENTS = int(os.getenv("TRANSCRIPT_CHUNK_OVERLAP_SEGMENTS", "6"))
 PASS1_MAX_CANDIDATES_PER_CHUNK = int(os.getenv("PASS1_MAX_CANDIDATES_PER_CHUNK", "10"))
@@ -111,7 +118,8 @@ def transcribe_audio(audio_path: str, gcs_uri: str = None) -> dict:
                     "gs_url": gcs_uri,
                     "delete_after": False
                 }
-                response = client.post(url, json=payload)
+                # C1: Whisper-Magiclips is IAM-only; send an ID token (+ X-Internal-Token).
+                response = client.post(url, json=payload, headers=internal_auth_headers(url))
                 response.raise_for_status()
                 return response.json()
         except Exception as e:
@@ -125,7 +133,7 @@ def transcribe_audio(audio_path: str, gcs_uri: str = None) -> dict:
         with open(audio_path, "rb") as f:
             files = {"file": (os.path.basename(audio_path), f, "audio/mpeg")}
             with httpx.Client(timeout=300.0) as client:
-                response = client.post(url, files=files)
+                response = client.post(url, files=files, headers=internal_auth_headers(url))
                 response.raise_for_status()
                 return response.json()
     except Exception as e:
@@ -180,27 +188,33 @@ def _parse_json_from_text(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _call_gemini_for_json(model: genai.GenerativeModel, prompt: str, expected_key: str) -> Dict[str, Any]:
+def _call_gemini_for_json(model_fn, model_name: str, prompt: str, expected_key: str) -> Dict[str, Any]:
+    """Call Vertex AI Gemini and parse JSON response"""
     last_text = ""
     for attempt in range(1, GEMINI_JSON_RETRIES + 1):
-        response = model.generate_content(
-            [prompt],
-            generation_config={
-                "response_mime_type": "application/json",
-                "temperature": 0.2,
-            },
-        )
-        last_text = getattr(response, "text", "") or ""
-        data = _parse_json_from_text(last_text)
-        if isinstance(data, dict) and expected_key in data and isinstance(data[expected_key], list):
-            return data
+        try:
+            response = model_fn(
+                model=model_name,
+                contents=[prompt],
+                config={
+                    "response_mime_type": "application/json",
+                    "temperature": 0.2,
+                },
+            )
+            last_text = response.text if hasattr(response, 'text') else str(response)
+            data = _parse_json_from_text(last_text)
+            if isinstance(data, dict) and expected_key in data and isinstance(data[expected_key], list):
+                return data
 
-        logger.warning(
-            "Gemini JSON parse/schema mismatch on attempt %d/%d (expected key: %s)",
-            attempt,
-            GEMINI_JSON_RETRIES,
-            expected_key,
-        )
+            logger.warning(
+                "Gemini JSON parse/schema mismatch on attempt %d/%d (expected key: %s)",
+                attempt,
+                GEMINI_JSON_RETRIES,
+                expected_key,
+            )
+        except Exception as e:
+            logger.warning(f"Gemini API call failed on attempt {attempt}/{GEMINI_JSON_RETRIES}: {e}")
+            last_text = str(e)
 
     logger.error("Gemini failed to return valid JSON for key '%s'. Last response: %s", expected_key, last_text[:800])
     return {expected_key: []}
@@ -503,6 +517,7 @@ def analyze_audio_with_gemini(
     num_clips: Optional[int] = None,
     max_duration: int = 90,
     gcs_audio_uri: str = None,
+    total_duration_seconds: float = None,
 ) -> list:
     """
     Analyzes the audio/video file using Gemini to find viral moments.
@@ -510,22 +525,26 @@ def analyze_audio_with_gemini(
 
     Args:
         media_path: Local path to media file
-        api_key: Google API key for Gemini
+        api_key: Deprecated - now uses Vertex AI service account (ignored if provided)
         num_clips: Number of viral clips to return. If None/<=0, return all high-quality clips.
         max_duration: Max duration per clip in seconds
         gcs_audio_uri: Optional GCS URI (gs://...) of extracted audio to use for Whisper transcription
     """
 
-    if not api_key:
-        api_key = os.getenv("GOOGLE_API_KEY")
+    # Initialize Vertex AI client (uses service account from GOOGLE_APPLICATION_CREDENTIALS)
+    try:
+        gemini_client = genai.Client(
+            vertexai=True,
+            project=VERTEX_PROJECT,
+            location=VERTEX_LOCATION,
+        )
+        logger.info(f"Initialized Vertex AI Gemini client: project={VERTEX_PROJECT}, location={VERTEX_LOCATION}, model={MODEL_NAME}")
+    except Exception as e:
+        logger.error(f"Failed to initialize Vertex AI client: {e}")
+        raise ValueError(f"Vertex AI initialization failed: {e}")
 
-    if not api_key:
-        logger.error("No Google API Key provided for Gemini analysis.")
-        raise ValueError("GOOGLE_API_KEY not found")
-
-    genai.configure(api_key=api_key)
-
-    total_duration_seconds = get_video_duration(media_path)
+    if total_duration_seconds is None or total_duration_seconds <= 0:
+        total_duration_seconds = get_video_duration(media_path) if media_path else 0.0
     total_duration_str = time.strftime('%H:%M:%S', time.gmtime(total_duration_seconds))
     logger.info(f"Video duration: {total_duration_str} ({total_duration_seconds} seconds)")
 
@@ -562,7 +581,9 @@ def analyze_audio_with_gemini(
         return []
 
     try:
-        model = genai.GenerativeModel(model_name=MODEL_NAME)
+        # Create model instance using Vertex AI client
+        model = gemini_client.models.generate_content
+        model_name = MODEL_NAME
         clip_limit = num_clips if isinstance(num_clips, int) and num_clips > 0 else None
 
         chunks = _build_transcript_chunks(transcript_text)
@@ -580,7 +601,7 @@ def analyze_audio_with_gemini(
                 total_duration_seconds=total_duration_seconds,
                 max_duration=max_duration,
             )
-            data = _call_gemini_for_json(model, pass1_prompt, expected_key="candidates")
+            data = _call_gemini_for_json(model, model_name, pass1_prompt, expected_key="candidates")
             raw_candidates = data.get("candidates", [])
 
             for raw in raw_candidates:
@@ -598,7 +619,9 @@ def analyze_audio_with_gemini(
             logger.warning("No candidates from pass-1.")
             return []
 
-        pass1_keep_max = MAX_CANDIDATES_FOR_RERANK if clip_limit is not None else None
+        # When clip_limit is None (return all clips), don't limit pass-1 candidates
+        # When clip_limit is set, limit pass-1 to MAX_CANDIDATES_FOR_RERANK for efficiency
+        pass1_keep_max = None if clip_limit is None else MAX_CANDIDATES_FOR_RERANK
         deduped = _dedupe_candidates(all_candidates, keep_max=pass1_keep_max)
         logger.info("Pass-1 produced %d candidates, %d after dedupe", len(all_candidates), len(deduped))
 
@@ -609,7 +632,7 @@ def analyze_audio_with_gemini(
             num_clips=clip_limit,
             max_duration=max_duration,
         )
-        pass2_data = _call_gemini_for_json(model, pass2_prompt, expected_key="clips")
+        pass2_data = _call_gemini_for_json(model, model_name, pass2_prompt, expected_key="clips")
         pass2_raw = pass2_data.get("clips", [])
 
         candidate_index = {c["id"]: c for c in deduped if c.get("id")}

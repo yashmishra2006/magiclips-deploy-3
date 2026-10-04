@@ -45,10 +45,6 @@ Thumbs.db
 # Logs
 *.log
 
-# Environment variables
-.env
-.env.local
-
 # Test files
 test*.py
 *_test.py
@@ -70,3 +66,7 @@ README.md
 # Scripts
 deploy.sh
 curl_*.sh
+
+# Environment variables
+.env
+.env.local

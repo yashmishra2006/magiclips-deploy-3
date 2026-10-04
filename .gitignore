@@ -1,6 +1,11 @@
 *pt
 *mp4
 *mp3
-.env
 caps-85254-firebase-adminsdk.json
 .venv
+
+*.log
+__pycache__/
+tmp_uploads/
+
+.env

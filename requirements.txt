@@ -43,6 +43,7 @@ uvicorn
 python-multipart
 python-dotenv
 httpx
+curl_cffi>=0.5.0                # For YouTube downloader (Cloudflare bypass)
 
 # --------------------------------------------------------
 # ML / CPU
@@ -50,9 +51,9 @@ httpx
 scikit-learn
 
 # --------------------------------------------------------
-# AI / LLM
+# AI / LLM (Vertex AI)
 # --------------------------------------------------------
-google-generativeai>=0.8.3
+google-genai>=0.1.0
 
 # --------------------------------------------------------
 # CLOUD / FIREBASE
@@ -62,3 +63,5 @@ firebase-admin
 google-auth
 google-auth-oauthlib
 google-auth-httplib2
+google-cloud-pubsub            # For Pub/Sub queue management
+google-cloud-tasks             # For Cloud Tasks (if still needed)

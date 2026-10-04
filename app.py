@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import sys
 
 import logging
 logging.getLogger("torch").setLevel(logging.ERROR)
@@ -7,23 +8,25 @@ logging.getLogger("torch").setLevel(logging.ERROR)
 import uuid
 import time
 import re
+import math
 import asyncio
 import json
 import subprocess
-from datetime import timedelta, datetime
+import tempfile
+from urllib.parse import quote, urlparse
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, HTTPException, Header, Depends, Body
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
+from fastapi import FastAPI, HTTPException, Header, Body
+from fastapi.responses import JSONResponse
 
 import httpx
 from google.cloud import storage
 import firebase_admin
-from firebase_admin import credentials, firestore, auth
+from firebase_admin import credentials, firestore
 
-import yt_dlp
 from gemini_analysis import analyze_audio_with_gemini
+from internal_auth import verify_internal_token, internal_auth_headers
+from pubsub_publisher import create_clip_publisher
 
 
 # ──────────────────────────────────────────────────────────────
@@ -42,12 +45,27 @@ UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./tmp_uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 GCP_BUCKET_NAME = os.getenv("GCP_BUCKET_NAME", "subtitlegen-input")
-CLIP_OUTPUT_BUCKET = os.getenv("CLIP_OUTPUT_BUCKET", "subtitlegen-output")
-CLIP_OUTPUT_PREFIX = os.getenv("CLIP_OUTPUT_PREFIX", "viral_")
-CLIP_OUTPUT_EXT = os.getenv("CLIP_OUTPUT_EXT", ".mp4")
-LOGO_PATH = Path(os.getenv("WATERMARK_LOGO_PATH", "logo.png"))
-WATERMARK_MARGIN_PX = int(os.getenv("WATERMARK_MARGIN_PX", "24"))
-WATERMARK_WIDTH_RATIO = float(os.getenv("WATERMARK_WIDTH_RATIO", "0.16"))
+# Buckets the worker may read a source video from (comma list).
+ALLOWED_INPUT_BUCKETS = {
+    b.strip() for b in os.getenv("ALLOWED_INPUT_BUCKETS", GCP_BUCKET_NAME).split(",") if b.strip()
+}
+
+# SC-8: hard caps checked BEFORE any download / audio extraction.
+MAX_SOURCE_BYTES = int(os.getenv("MAX_SOURCE_BYTES", str(6 * 1024 ** 3)))          # 6 GiB
+MAX_SOURCE_DURATION_SECONDS = float(os.getenv("MAX_SOURCE_DURATION_SECONDS", "10800"))  # 3 h
+# SC-8: a claimed run holds a lease; a Cloud Tasks retry that arrives while the
+# lease is live gets 409 (retry later) instead of starting duplicate work.
+WORKER_LEASE_SECONDS = float(os.getenv("WORKER_LEASE_SECONDS", "1900"))
+FFPROBE_TIMEOUT_SECONDS = int(os.getenv("FFPROBE_TIMEOUT_SECONDS", "90"))
+AUDIO_EXTRACT_TIMEOUT_SECONDS = int(os.getenv("AUDIO_EXTRACT_TIMEOUT_SECONDS", "900"))
+
+# SEC-11: YouTube downloader endpoint. HTTPS only unless explicitly overridden.
+YOUTUBE_DOWNLOADER_ALLOW_INSECURE_HTTP = os.getenv("YOUTUBE_DOWNLOADER_ALLOW_INSECURE_HTTP", "") == "1"
+YOUTUBE_DOWNLOADER_BUCKET = os.getenv("YOUTUBE_DOWNLOADER_BUCKET", GCP_BUCKET_NAME)
+YOUTUBE_DOWNLOADER_PREFIX = os.getenv("YOUTUBE_DOWNLOADER_PREFIX", "youtube_downloads/")
+
+PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+UID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 # Firebase initialization
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "caps-85254")
@@ -56,824 +74,634 @@ FIREBASE_STORAGE_BUCKET = os.getenv(
     f"{FIREBASE_PROJECT_ID}.appspot.com"
 )
 
-if not firebase_admin._apps:
-    cert_path = os.getenv("FIREBASE_CERT_PATH", "caps-85254-firebase-adminsdk.json")
-    if not Path(cert_path).exists():
-        raise FileNotFoundError(f"Firebase credentials not found: {cert_path}")
 
-    cred = credentials.Certificate(cert_path)
+def _init_firebase():
+    """SEC-1: use the Cloud Run runtime service account (ADC) in production.
+
+    A key file is used only when FIREBASE_CERT_PATH points at an existing file
+    (local development). Key files are git/docker/gcloud-ignored, so the image
+    never contains one and falls through to ADC.
+    """
+    if firebase_admin._apps:
+        return
+    cert_path = os.getenv("FIREBASE_CERT_PATH", "caps-85254-firebase-adminsdk.json")
+    if cert_path and Path(cert_path).is_file():
+        cred = credentials.Certificate(cert_path)
+        logger.info("Firebase: using key file %s", cert_path)
+    else:
+        cred = credentials.ApplicationDefault()
+        logger.info("Firebase: using Application Default Credentials")
     firebase_admin.initialize_app(cred, {
         "projectId": FIREBASE_PROJECT_ID,
         "storageBucket": FIREBASE_STORAGE_BUCKET,
     })
-    logger.info("Firebase initialized successfully")
 
+
+_init_firebase()
 db = firestore.client()
 
-def get_storage_client():
-    project = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT") or FIREBASE_PROJECT_ID
-    cert_path = os.getenv("FIREBASE_CERT_PATH", "new-backend-475414-228aab3a465a.json")
-    if Path(cert_path).exists():
-        return storage.Client.from_service_account_json(cert_path, project=project)
-    return storage.Client(project=project)
+_storage_client = None
 
-async def upload_to_gcs(local_path: Path, dest_name: str) -> str:
-    import logging
-    logger = logging.getLogger("capsai.gcp.upload")
-    try:
-        logger.info(f"Starting GCP upload: local_path={local_path}, dest_name={dest_name}, bucket={GCP_BUCKET_NAME}")
-        client = get_storage_client()
-        bucket = client.bucket(GCP_BUCKET_NAME)
-        blob = bucket.blob(dest_name)
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, blob.upload_from_filename, str(local_path))
-        logger.info(f"Upload to GCP bucket succeeded: gs://{bucket.name}/{dest_name}")
-        # Return the GCP gs:// URL (not signed, not public)
-        gcp_url = f"gs://{bucket.name}/{dest_name}"
-        logger.info(f"Returning GCP URL: {gcp_url}")
-        return gcp_url
-    except Exception as e:
-        logger.error(f"GCP upload failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"GCP upload failed: {e}")
+
+def get_storage_client():
+    """Storage client from the shipped service-account key when present, else ADC."""
+    global _storage_client
+    if _storage_client is None:
+        project = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT_ID") or None
+        key_path = os.getenv("GCS_CERT_PATH", "new-backend-475414-228aab3a465a.json")
+        if Path(key_path).is_file():
+            _storage_client = storage.Client.from_service_account_json(key_path, project=project)
+        else:
+            _storage_client = storage.Client(project=project)
+    return _storage_client
+
+
+def upload_to_gcs_sync(local_path: Path, dest_name: str, content_type: str | None = None) -> str:
+    bucket = get_storage_client().bucket(GCP_BUCKET_NAME)
+    blob = bucket.blob(dest_name)
+    blob.upload_from_filename(str(local_path), content_type=content_type)
+    return f"gs://{bucket.name}/{dest_name}"
 
 
 # ──────────────────────────────────────────────────────────────
-# YouTube helpers
+# GCS helpers
+# ──────────────────────────────────────────────────────────────
+
+def parse_gs_uri(uri: str) -> tuple[str, str]:
+    if not isinstance(uri, str) or not uri.startswith("gs://"):
+        raise ValueError("Not a gs:// URI")
+    bucket, _, blob = uri[5:].partition("/")
+    if not bucket or not blob or ".." in blob.split("/"):
+        raise ValueError("Malformed gs:// URI")
+    return bucket, blob
+
+
+def is_allowed_source_uri(uri: str) -> bool:
+    try:
+        bucket, _ = parse_gs_uri(uri)
+    except ValueError:
+        return False
+    return bucket in ALLOWED_INPUT_BUCKETS
+
+
+def gcs_access_token() -> str:
+    import google.auth
+    import google.auth.transport.requests
+    creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/devstorage.read_only"])
+    creds.refresh(google.auth.transport.requests.Request())
+    return creds.token
+
+
+def gcs_http_input(bucket: str, blob: str) -> tuple[list[str], str]:
+    """(header args, url) to stream an object over HTTPS with range requests (no full download)."""
+    url = f"https://storage.googleapis.com/{bucket}/{quote(blob, safe='/')}"
+    args = [
+        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+        "-headers", f"Authorization: Bearer {gcs_access_token()}\r\n",
+    ]
+    return args, url
+
+
+class PermanentJobError(Exception):
+    """A failure that retrying cannot fix: mark the project failed, refund, ack the task."""
+
+
+class ClaimRejected(Exception):
+    """The task does not match the project (missing, wrong owner/type). Touch nothing."""
+
+
+def probe_duration_seconds_gcs(bucket: str, blob: str) -> float:
+    http_args, url = gcs_http_input(bucket, blob)
+    cmd = ["ffprobe", "-v", "error", *http_args,
+           "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", url]
+    try:
+        probe = subprocess.run(cmd, capture_output=True, text=True, timeout=FFPROBE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise PermanentJobError("Timed out reading the source video's duration")
+    if probe.returncode != 0:
+        raise PermanentJobError("Could not read the source video (ffprobe failed)")
+    try:
+        value = float((probe.stdout or "").strip().splitlines()[0])
+    except (ValueError, IndexError):
+        value = 0.0
+    return value if math.isfinite(value) and value > 0 else 0.0
+
+
+def extract_audio_from_gcs_sync(bucket: str, blob: str, audio_path: str) -> str:
+    """Stream the source from GCS and extract mono MP3 audio (no full video download)."""
+    http_args, url = gcs_http_input(bucket, blob)
+    cmd = [
+        "ffmpeg", "-y", "-nostdin", "-v", "error",
+        "-fflags", "+genpts+discardcorrupt",
+        "-err_detect", "ignore_err",
+        *http_args, "-i", url,
+        "-map", "0:a:0",
+        "-vn", "-dn", "-sn",
+        "-af", "aresample=async=1:first_pts=0",
+        "-ar", "48000", "-ac", "1",
+        "-c:a", "libmp3lame", "-q:a", "2",
+        audio_path,
+    ]
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                text=True, timeout=AUDIO_EXTRACT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise PermanentJobError("Audio extraction timed out")
+    if result.returncode != 0:
+        stderr = (result.stderr or "")[-600:]
+        if "matches no streams" in stderr or "Stream map" in stderr:
+            raise PermanentJobError("The video has no audio track")
+        logger.error("Audio extraction ffmpeg failed: %s", stderr)
+        raise PermanentJobError("Could not extract audio from the video")
+    if not Path(audio_path).exists() or Path(audio_path).stat().st_size == 0:
+        raise PermanentJobError("Audio extraction produced empty output")
+    return audio_path
+
+
+# ──────────────────────────────────────────────────────────────
+# YouTube helpers (SEC-11)
 # ──────────────────────────────────────────────────────────────
 
 YOUTUBE_REGEX = re.compile(
-    r'(?:https?:\/\/)?(?:www\.)?(?:'
+    r'(?:https?:\/\/)?(?:www\.|m\.)?(?:'
     r'youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.*?v=|shorts\/)'
     r')([\w\-]{11})(?:[^\w\-]|$)'
 )
 
+
 def is_youtube_url(url: str) -> bool:
-    return bool(YOUTUBE_REGEX.search(url))
+    return isinstance(url, str) and bool(YOUTUBE_REGEX.search(url))
 
-async def process_youtube_via_external_api(youtube_url: str) -> str:
+
+def youtube_downloader_url() -> str:
+    url = os.getenv("YOUTUBE_DOWNLOADER_URL", "").strip()
+    if not url:
+        raise PermanentJobError("YouTube import is not configured (YOUTUBE_DOWNLOADER_URL unset)")
+    scheme = urlparse(url).scheme
+    if scheme != "https" and not (scheme == "http" and YOUTUBE_DOWNLOADER_ALLOW_INSECURE_HTTP):
+        raise PermanentJobError("YouTube downloader must be reached over HTTPS")
+    return url
+
+
+_YT_URI_RE_TEMPLATE = r"^gs://{bucket}/{prefix}[A-Za-z0-9_-]+/{name}$"
+
+
+def validate_downloader_uris(video_gcs: str, audio_gcs: str) -> None:
+    """Only accept objects the downloader is supposed to write (bucket + prefix + file name)."""
+    bucket = re.escape(YOUTUBE_DOWNLOADER_BUCKET)
+    prefix = re.escape(YOUTUBE_DOWNLOADER_PREFIX)
+    video_re = _YT_URI_RE_TEMPLATE.format(bucket=bucket, prefix=prefix, name=r"video\.mp4")
+    audio_re = _YT_URI_RE_TEMPLATE.format(bucket=bucket, prefix=prefix, name=r"audio\.(?:mp3|m4a)")
+    if not isinstance(video_gcs, str) or not re.fullmatch(video_re, video_gcs):
+        raise PermanentJobError("Downloader returned an unexpected video location")
+    if not isinstance(audio_gcs, str) or not re.fullmatch(audio_re, audio_gcs):
+        raise PermanentJobError("Downloader returned an unexpected audio location")
+
+
+async def download_youtube_video_external(youtube_url: str) -> tuple[str, str, float]:
+    """Download via the external downloader, which uploads to GCS itself.
+
+    Returns (video_gcs_uri, audio_gcs_uri, duration_seconds).
     """
-    Call external API to process YouTube video and return GCS URL.
-    Returns: gs:// URL of the processed video
-    """
-    api_url = "http://34.131.185.69:8002/process"
-    # api_url = "http://localhost:8002/process"
-    
-    logger.info(f"Calling external API for YouTube URL: {youtube_url}")
-    
+    downloader_url = youtube_downloader_url()
+    headers = await asyncio.to_thread(internal_auth_headers, downloader_url)
+    logger.info("Calling YouTube downloader for %s", youtube_url)
     try:
-        async with httpx.AsyncClient(timeout=600.0) as client:
-            response = await client.get(api_url, params={"url": youtube_url})
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            if data.get("status") != "success":
-                raise HTTPException(500, f"External API returned error: {data}")
-            
-            gcs_url = data.get("gcs_url")
-            if not gcs_url:
-                raise HTTPException(500, "External API did not return gcs_url")
-            
-            logger.info(f"External API returned GCS URL: {gcs_url}")
-            return gcs_url
-            
+        async with httpx.AsyncClient(timeout=600.0, follow_redirects=False) as client:
+            response = await client.post(downloader_url, json={"url": youtube_url}, headers=headers)
     except httpx.HTTPError as e:
-        logger.error(f"External API call failed: {e}")
-        raise HTTPException(500, f"Failed to process YouTube URL via external API: {str(e)}")
-
-async def download_youtube_video(url: str, output_dir: Path) -> Path:
-    """
-    Download YouTube video using yt-dlp
-    Returns path to downloaded file
-    """
-    video_id_match = YOUTUBE_REGEX.search(url)
-    if not video_id_match:
-        raise ValueError("Not a valid YouTube video URL")
-
-    video_id = video_id_match.group(1)
-    filename = f"yt_{video_id}_{int(time.time())}.mp4"
-    output_path = output_dir / filename
-
-    cookies_path = os.getenv("COOKIES_PATH", "/cookies.txt")
-
-    ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        'outtmpl': str(output_path),
-        'quiet': True,
-        'continuedl': True,
-        'retries': 10,
-        'fragment_retries': 10,
-        'merge_output_format': 'mp4',
-
-        # ──── Most important changes ─────
-        'cookiefile': cookies_path if Path(cookies_path).is_file() else None,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'web'],   # very helpful in 2026
-                'lang': ['en'],
-            }
-        },
-        # Optional but often helps
-        'force_generic_extractor': False,
-        'source_address': '0.0.0.0',  # sometimes helps in containers
-    }
-
-    logger.info(f"Starting YouTube download → {url} (id: {video_id})")
-
+        raise PermanentJobError(f"YouTube downloader unreachable: {e}")
+    if response.status_code >= 400:
+        raise PermanentJobError(f"YouTube download failed (HTTP {response.status_code})")
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            await asyncio.to_thread(ydl.download, [url])
+        data = response.json()
+    except ValueError:
+        raise PermanentJobError("YouTube downloader returned invalid JSON")
+    if data.get("status") != "success":
+        raise PermanentJobError("YouTube downloader reported an error")
 
-        if not output_path.exists():
-            raise RuntimeError("Downloaded file not found after yt-dlp finished")
-
-        logger.info(f"YouTube video saved → {output_path}")
-        return output_path
-
-    except Exception as e:
-        logger.error(f"YouTube download failed: {e}", exc_info=True)
-        if output_path.exists():
-            try:
-                output_path.unlink()
-            except:
-                pass
-        raise
-
-# ──────────────────────────────────────────────────────────────
-# Download helpers (HTTP + GCS)
-# ──────────────────────────────────────────────────────────────
-
-async def download_to_tmp(url: str, suffix: str = ".mp4") -> Path:
-    tmp_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
+    video_gcs = data.get("video_gcs")
+    audio_gcs = data.get("audio_gcs")
+    validate_downloader_uris(video_gcs, audio_gcs)
     try:
-        async with httpx.AsyncClient(timeout=600.0, follow_redirects=True) as client:
-            async with client.stream("GET", url) as resp:
-                resp.raise_for_status()
-                with open(tmp_path, "wb") as f:
-                    async for chunk in resp.aiter_bytes(chunk_size=8192):
-                        f.write(chunk)
-        return tmp_path
-    except Exception as e:
-        logger.error(f"HTTP download failed: {e}")
-        raise HTTPException(500, f"Download failed: {str(e)}")
+        duration_seconds = float(data.get("duration_seconds") or 0.0)
+    except (TypeError, ValueError):
+        duration_seconds = 0.0
+    if not math.isfinite(duration_seconds):
+        duration_seconds = 0.0
+    return video_gcs, audio_gcs, duration_seconds
 
-
-async def download_from_gcs(gs_uri: str, suffix: str = ".mp4") -> Path:
-    if not gs_uri.startswith("gs://"):
-        raise ValueError("Invalid GCS URI format")
-
-    _, path = gs_uri.split("gs://", 1)
-    bucket_name, *parts = path.split("/", 1)
-    blob_name = parts[0] if parts else ""
-
-    tmp_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
-
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(blob_name)
-
-    logger.info(f"Downloading from GCS: {gs_uri}")
-    await asyncio.to_thread(blob.download_to_filename, str(tmp_path))
-
-    return tmp_path
-
-
-def extract_audio_sync(video_path: str, audio_path: str) -> str:
-    import subprocess
-    try:
-        cmd = [
-            'ffmpeg', '-y',
-            '-i', video_path,
-            '-vn',
-            '-acodec', 'libmp3lame',
-            '-q:a', '4',
-            audio_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed:\n{result.stderr}")
-        return audio_path
-    except Exception as e:
-        logger.error(f"Audio extraction failed: {e}", exc_info=True)
-        raise
 
 # ──────────────────────────────────────────────────────────────
-# Parallel Cloud Run viral clip processing
+# Pure helpers (unit-tested)
 # ──────────────────────────────────────────────────────────────
-
 
 def srt_time_to_seconds(time_str) -> float:
     """Converts HH:MM:SS / MM:SS / seconds to float."""
     if isinstance(time_str, (int, float)):
         return float(time_str)
-
     try:
         time_str = str(time_str).strip()
         time_str = time_str.replace(', ', ':').replace('. ', ':').replace(',', '.').replace(' ', '')
-
         parts = time_str.split(':')
-        seconds = 0.0
-
         if len(parts) == 3:
-            seconds += int(parts[0]) * 3600
-            seconds += int(parts[1]) * 60
-            seconds += float(parts[2])
-        elif len(parts) == 2:
-            seconds += int(parts[0]) * 60
-            seconds += float(parts[1])
-        elif len(parts) == 1:
-            seconds = float(parts[0])
-
-        logger.info(f"Parsed time '{time_str}' -> {seconds}s")
-        return seconds
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        return float(parts[0])
     except Exception as e:
         logger.error(f"Time parsing error for '{time_str}': {e}")
+        return float("nan")
+
+
+def normalize_clip_windows(viral_clips_meta: list, source_duration: float) -> list[dict]:
+    """Parse Gemini's clip windows, clamp them to the source and drop invalid ones.
+
+    A clip starting at 0 is valid (the old `if not start` check dropped it).
+    """
+    out = []
+    seen = set()
+    for meta in viral_clips_meta or []:
+        if not isinstance(meta, dict):
+            continue
+        start, end = meta.get("start"), meta.get("end")
+        if start is None or end is None:
+            continue
+        start_sec = srt_time_to_seconds(start)
+        end_sec = srt_time_to_seconds(end)
+        if not (math.isfinite(start_sec) and math.isfinite(end_sec)):
+            continue
+        start_sec = max(0.0, start_sec)
+        if source_duration and source_duration > 0:
+            end_sec = min(end_sec, source_duration)
+        if end_sec - start_sec < 1.0:
+            continue
+        key = (round(start_sec, 2), round(end_sec, 2))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "start": round(start_sec, 3),
+            "end": round(end_sec, 3),
+            "reason": str(meta.get("reason", "") or "")[:2000],
+            "duration": round(end_sec - start_sec, 3),
+        })
+    return out
+
+
+def seconds_to_credit_minutes(duration_seconds: float) -> float:
+    """Convert video duration in seconds to billable minutes."""
+    if not isinstance(duration_seconds, (int, float)) or not math.isfinite(duration_seconds) or duration_seconds <= 0:
+        return 0.0
+    return round(float(duration_seconds) / 60.0, 2)
+
+
+def get_user_magic_balance(user_data: dict) -> float:
+    if not isinstance(user_data, dict):
+        return 0.0
+    try:
+        return round(float(user_data.get("magicmins", 0.0) or 0.0), 2)
+    except (TypeError, ValueError):
         return 0.0
 
 
-CLOUD_RUN_URL = "https://smart-clip-processor-627061442405.asia-southeast1.run.app/process-fields"
+class InsufficientCredits(PermanentJobError):
+    pass
 
 
-async def process_clips_parallel(clips: list) -> list:
+def plan_reservation(project_data: dict, user_data: dict, minutes: float) -> dict:
+    """Decide what the reservation transaction writes (SC-9 / C7).
+
+    Returns {"reuse": True} when this project already holds an unsettled
+    reservation (e.g. a retry after a crash), else the new balances.
+    Raises InsufficientCredits when the balance cannot cover `minutes`.
     """
-    Process all clips in parallel by calling the Cloud Run endpoint.
-    Each item in clips should be a dict with the required fields for /process-fields.
-    Returns a list of (status_code, response_json) tuples.
-    """
-
-    results = []
-    async with httpx.AsyncClient(timeout=600.0) as client:
-        tasks = [client.post(CLOUD_RUN_URL, json=clip) for clip in clips]
-        print(clips)
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
-        for resp in responses:
-            if isinstance(resp, Exception):
-                results.append((None, {"error": str(resp)}))
-            else:
-                try:
-                    results.append((resp.status_code, resp.json()))
-                except Exception as e:
-                    results.append((resp.status_code, {"error": str(e)}))
-    return results
-
-
-def resolve_user_status(user_data: dict) -> str:
-    """Resolve account tier from user document data."""
-    if not isinstance(user_data, dict):
-        return "free"
-
-    status_fields = [
-        user_data.get("usertype"),
-        user_data.get("userType"),
-        user_data.get("status"),
-        user_data.get("plan"),
-        user_data.get("tier"),
-        user_data.get("subscription"),
-    ]
-    status_text = " ".join(str(v).strip().lower() for v in status_fields if v is not None)
-
-    if user_data.get("isPremium") is True or user_data.get("premium") is True:
-        return "premium"
-    if any(token in status_text for token in ("premium", "pro", "paid", "plus")):
-        return "premium"
-    if any(token in status_text for token in ("free", "basic")):
-        return "free"
-    return "free"
-
-
-def should_generate_watermarked_clips(user_status: str) -> bool:
-    """Current product rule: generate watermark variants for both free and premium users."""
-    normalized = (user_status or "free").strip().lower()
-    return normalized in {"free", "premium"}
-
-
-def _parse_json_maybe(value):
-    """Parse JSON if value is a JSON string; otherwise return None."""
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not text or text[0] not in "{[":
-        return None
-    try:
-        return json.loads(text)
-    except Exception:
-        return None
-
-
-def extract_output_video_url(response_data: dict) -> str | None:
-    """Best-effort extraction of output clip URL from Cloud Run response JSON."""
-    preferred_keys = (
-        "videoUrl", "video_url", "video",
-        "clipUrl", "clip_url",
-        "outputUrl", "output_url",
-        "gcs_url", "gcsUrl",
-        "signed_url", "signedUrl",
-        "download_url", "downloadUrl",
-        "url",
-    )
-
-    def is_valid_url(value: str) -> bool:
-        return isinstance(value, str) and value.startswith(("gs://", "https://", "http://"))
-
-    def looks_like_blob_path(value: str) -> bool:
-        if not isinstance(value, str):
-            return False
-        v = value.strip()
-        if not v:
-            return False
-        if v.startswith(("gs://", "http://", "https://")):
-            return False
-        # Typical blob path in this project.
-        return "/" in v and "." in v
-
-    def from_blob_to_gs(value: str) -> str:
-        blob_name = value.lstrip("/")
-        return f"gs://{GCP_BUCKET_NAME}/{blob_name}"
-
-    def walk(node):
-        if isinstance(node, dict):
-            # 1) direct preferred keys (case-insensitive)
-            lowered = {str(k).lower(): v for k, v in node.items()}
-            for wanted in preferred_keys:
-                value = lowered.get(wanted.lower())
-                if is_valid_url(value):
-                    return value
-
-            # 2) blob/path key fallback
-            for k, v in node.items():
-                kl = str(k).lower()
-                if "input" in kl:
-                    continue
-                if isinstance(v, str) and ("blob" in kl or "path" in kl) and looks_like_blob_path(v):
-                    return from_blob_to_gs(v)
-
-            # 3) recurse into parsed JSON string fields first (e.g., body)
-            for k, v in node.items():
-                if isinstance(v, str):
-                    parsed = _parse_json_maybe(v)
-                    if parsed is not None:
-                        found = walk(parsed)
-                        if found:
-                            return found
-                    if is_valid_url(v):
-                        return v
-
-            # 4) recurse generic
-            for k, v in node.items():
-                if "input" in str(k).lower():
-                    continue
-                found = walk(v)
-                if found:
-                    return found
-
-        elif isinstance(node, list):
-            for item in node:
-                found = walk(item)
-                if found:
-                    return found
-
-        elif isinstance(node, str):
-            if is_valid_url(node):
-                return node
-            parsed = _parse_json_maybe(node)
-            if parsed is not None:
-                return walk(parsed)
-
-        return None
-
-    return walk(response_data)
-
-
-def infer_output_url_from_clip_id(clip_id: str) -> str | None:
-    """Infer deterministic output location from clip_id when Cloud Run omits URL."""
-    if not isinstance(clip_id, str) or not clip_id.strip():
-        return None
-    clean_id = clip_id.strip()
-    return f"gs://{CLIP_OUTPUT_BUCKET}/{CLIP_OUTPUT_PREFIX}{clean_id}{CLIP_OUTPUT_EXT}"
-
-
-def add_logo_watermark_sync(
-    input_video: Path,
-    output_video: Path,
-    logo_path: Path,
-    margin_px: int = WATERMARK_MARGIN_PX,
-    width_ratio: float = WATERMARK_WIDTH_RATIO,
-) -> None:
-    """Overlay logo at top-right corner using ffmpeg."""
-    if not input_video.exists():
-        raise FileNotFoundError(f"Input clip not found: {input_video}")
-    if not logo_path.exists():
-        raise FileNotFoundError(f"Logo file not found: {logo_path}")
-
-    filter_complex = (
-        f"[1:v][0:v]scale2ref=w=main_w*{width_ratio}:h=ow/mdar[logo][video];"
-        f"[video][logo]overlay=W-w-{margin_px}:{margin_px}"
-    )
-
-    base_cmd = [
-        "ffmpeg", "-y",
-        "-i", str(input_video),
-        "-i", str(logo_path),
-        "-filter_complex", filter_complex,
-        "-map", "0:v:0",
-        "-map", "0:a?",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "20",
-        "-movflags", "+faststart",
-        "-pix_fmt", "yuv420p",
-    ]
-
-    # Attempt audio stream copy first; fall back to AAC re-encode when needed.
-    cmd_copy_audio = base_cmd + ["-c:a", "copy", str(output_video)]
-    result = subprocess.run(cmd_copy_audio, capture_output=True, text=True)
-    if result.returncode == 0:
-        return
-
-    cmd_encode_audio = base_cmd + ["-c:a", "aac", "-b:a", "128k", str(output_video)]
-    result2 = subprocess.run(cmd_encode_audio, capture_output=True, text=True)
-    if result2.returncode != 0:
-        raise RuntimeError(
-            "Watermark ffmpeg failed.\n"
-            f"copy-audio stderr: {result.stderr[-1000:]}\n"
-            f"encode-audio stderr: {result2.stderr[-1000:]}"
+    existing = float(project_data.get("reservedMagicMins") or 0.0)
+    if existing > 0 and project_data.get("billingSettled") is False:
+        return {"reuse": True, "reserved": existing}
+    balance = get_user_magic_balance(user_data)
+    if balance + 1e-9 < minutes:
+        raise InsufficientCredits(
+            f"Insufficient magic credits. Required {minutes:.2f} minutes, available {balance:.2f} minutes."
         )
+    return {"reuse": False, "reserved": round(minutes, 2), "new_balance": round(balance - minutes, 2)}
+
+
+# "processing" without clipsPublishedAt means a live attempt is publishing right now.
+WORKER_ACTIVE_STATUSES = {
+    "claimed", "downloading", "validating_credits", "extracting_audio", "uploading_audio",
+    "transcribing", "finding_clips", "queueing_clips", "processing",
+}
+
+
+def plan_claim(project_data: dict | None, uid: str, attempt_id: str, now: float) -> str:
+    """Entry decision for a worker call (SC-8 idempotency).
+
+    "claim"  -> start a run
+    "noop"   -> already done / clips already published, ack the task
+    "busy"   -> another attempt holds a live lease, ask Cloud Tasks to retry later
+    Raises ClaimRejected for missing project / ownership / type problems.
+    """
+    if project_data is None:
+        raise ClaimRejected("Project not found")
+    if project_data.get("userId") != uid:
+        raise ClaimRejected("Project does not belong to this user")
+    if project_data.get("type") != "magiclip":
+        raise ClaimRejected("Project is not a Smart Clips project")
+    status = project_data.get("status")
+    if status == "completed":
+        return "noop"
+    if status == "processing" and project_data.get("clipsPublishedAt") and project_data.get("expectedClipIds"):
+        total = int(project_data.get("totalClips") or 0)
+        done = int(project_data.get("completedClips") or 0) + int(project_data.get("failedClips") or 0)
+        if done < total:
+            return "noop"  # clips of this run are still being processed
+    lease = project_data.get("workerLeaseUntil")
+    if (
+        status in WORKER_ACTIVE_STATUSES
+        and isinstance(lease, (int, float))
+        and lease > now
+        and project_data.get("workerAttemptId") != attempt_id
+    ):
+        return "busy"
+    return "claim"
+
+
+# ──────────────────────────────────────────────────────────────
+# Firestore transactions
+# ──────────────────────────────────────────────────────────────
+
+def _project_ref(project_id: str):
+    return db.collection("projects").document(project_id)
+
+
+def claim_project(project_id: str, uid: str, attempt_id: str) -> tuple[str, dict]:
+    project_ref = _project_ref(project_id)
+    txn = db.transaction()
+
+    @firestore.transactional
+    def _claim(transaction):
+        snap = project_ref.get(transaction=transaction)
+        data = snap.to_dict() if snap.exists else None
+        decision = plan_claim(data, uid, attempt_id, time.time())
+        if decision == "claim":
+            transaction.update(project_ref, {
+                "status": "claimed",
+                "workerAttemptId": attempt_id,
+                "workerLeaseUntil": time.time() + WORKER_LEASE_SECONDS,
+                "workerStartedAt": firestore.SERVER_TIMESTAMP,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+                # reset per-run clip progress (billing fields are owned by reserve/settle)
+                "clips": [],
+                "clipCount": 0,
+                "completedClips": 0,
+                "failedClips": 0,
+                "failedClipIds": [],
+                "expectedClipIds": [],
+                "clipsPublishedAt": firestore.DELETE_FIELD,
+                "error": firestore.DELETE_FIELD,
+            })
+        return decision, data or {}
+
+    return _claim(txn)
+
+
+def reserve_magic_minutes(project_id: str, uid: str, minutes: float) -> float:
+    project_ref = _project_ref(project_id)
+    user_ref = db.collection("users").document(uid)
+    txn = db.transaction()
+
+    @firestore.transactional
+    def _reserve(transaction):
+        project_snap = project_ref.get(transaction=transaction)
+        user_snap = user_ref.get(transaction=transaction)
+        project_data = project_snap.to_dict() or {}
+        user_data = user_snap.to_dict() if user_snap.exists else {}
+        plan = plan_reservation(project_data, user_data, minutes)
+        if plan["reuse"]:
+            return plan["reserved"]
+        transaction.update(user_ref, {
+            "magicmins": plan["new_balance"],
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+        transaction.update(project_ref, {
+            "reservedMagicMins": plan["reserved"],
+            "billingSettled": False,
+            "billingStatus": "reserved",
+            "reservedAt": firestore.SERVER_TIMESTAMP,
+            "minutesToDeduct": plan["reserved"],
+        })
+        return plan["reserved"]
+
+    return _reserve(txn)
+
+
+def fail_project_and_refund(project_id: str, uid: str, message: str, attempt_id: str):
+    """Mark the run failed and give back any unsettled reservation, once."""
+    project_ref = _project_ref(project_id)
+    user_ref = db.collection("users").document(uid)
+    txn = db.transaction()
+
+    @firestore.transactional
+    def _fail(transaction):
+        snap = project_ref.get(transaction=transaction)
+        if not snap.exists:
+            return
+        data = snap.to_dict() or {}
+        if data.get("workerAttemptId") != attempt_id:
+            return  # not ours (never claimed, or a newer attempt owns it)
+        if data.get("status") == "completed":
+            return
+        updates = {
+            "status": "failed",
+            "error": message[:1000],
+            "errorMessage": message[:1000],
+            "failedAt": firestore.SERVER_TIMESTAMP,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "workerLeaseUntil": 0,
+            # late Pub/Sub messages for this run become no-ops in the processor
+            "expectedClipIds": [],
+        }
+        reserved = float(data.get("reservedMagicMins") or 0.0)
+        if reserved > 0 and data.get("billingSettled") is False and data.get("userId") == uid:
+            transaction.update(user_ref, {"magicmins": firestore.Increment(reserved)})
+            updates.update({
+                "billingSettled": True,
+                "billingStatus": "refunded",
+                "chargedMagicMins": 0.0,
+                "refundedMagicMins": reserved,
+                "minutesDeducted": 0.0,
+            })
+        transaction.update(project_ref, updates)
+
+    try:
+        _fail(txn)
+    except Exception as e:
+        logger.error("Failed to mark project %s failed / refund: %s", project_id, e, exc_info=True)
+
 
 # ──────────────────────────────────────────────────────────────
 # FastAPI app
 # ──────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="CapsAI - Viral Clips Generator",
-    description="Generate viral clips from YouTube / direct video links",
-    version="0.1.1"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    title="CapsAI - Viral Clips Worker",
+    description="Internal Cloud Tasks worker: analyses a source and queues per-clip jobs",
+    version="0.2.0",
 )
 
 
-async def verify_firebase_token(authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Missing or invalid Authorization header")
+class WorkerBusy(Exception):
+    pass
 
-    id_token = authorization.split(" ", 1)[1]
-    try:
-        decoded = auth.verify_id_token(id_token)
-        uid = decoded["uid"]
-        user_doc = db.collection("users").document(uid).get()
-        return {
-            "uid": uid,
-            "user_data": user_doc.to_dict() if user_doc.exists else {}
+
+async def run_viral_clips_job(project_id: str, uid: str, video_url: str, attempt_id: str) -> dict:
+    """One Smart Clips run: validate, reserve credits, analyse, publish clip jobs.
+
+    The per-clip processor appends clips and settles billing (contract C7).
+    """
+    log = logging.getLogger("capsai.viral_clips")
+
+    decision, project = await asyncio.to_thread(claim_project, project_id, uid, attempt_id)
+    if decision == "noop":
+        log.info("Project %s already processed/published; acking duplicate task", project_id)
+        return {"success": True, "projectId": project_id, "duplicate": True}
+    if decision == "busy":
+        raise WorkerBusy()
+
+    def update_status(status: str, **extra):
+        payload = {
+            "status": status,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "workerLeaseUntil": time.time() + WORKER_LEASE_SECONDS,
         }
-    except Exception as e:
-        raise HTTPException(401, f"Token verification failed: {str(e)}")
-
-
-class ViralClipRequest(BaseModel):
-    videoUrl: str   # more permissive than HttpUrl
-
-
-# ──────────────────────────────────────────────────────────────
-# Background processing with YouTube support
-# ──────────────────────────────────────────────────────────────
-
-async def process_viral_clips_background(project_id: str, uid: str, video_url: str):
-    """Background task to process viral clips using parallel Lambda invocation."""
-    logger = logging.getLogger("capsai.viral_clips")
-    logger.info(f"Background processing started for project {project_id}")
-
-    tmp_video_path = None
-    tmp_audio_path = None
-    audio_gcp_url = None
-    input_video_gcp_uri = None
-    user_data = {}
-    user_status = "free"
-    generated_clips = []
-    watermark_clips = []
-
-    def update_status(status: str, **extra_fields):
-        if not db:
-            return
+        payload.update(extra)
         try:
-            doc_ref = db.collection("projects").document(project_id)
-            payload = {
-                "status": status,
-                "updatedAt": firestore.SERVER_TIMESTAMP,
-            }
-            if extra_fields:
-                payload.update(extra_fields)
-            doc_ref.update(payload)
-            logger.info(f"Status updated → {status}")
+            _project_ref(project_id).update(payload)
         except Exception as e:
-            logger.error(f"Failed to update status to {status}: {e}")
-    
-    try:
-        # Resolve user status once for tier-based behavior.
-        if db:
-            try:
-                user_doc_snapshot = db.collection("users").document(uid).get()
-                if user_doc_snapshot.exists:
-                    user_data = user_doc_snapshot.to_dict() or {}
-                user_status = resolve_user_status(user_data)
-                logger.info(f"Resolved user status for {uid}: {user_status}")
-            except Exception as e:
-                logger.warning(f"Could not resolve user status for {uid}, defaulting to free: {e}")
-                user_status = "free"
+            log.error("Failed to update status to %s: %s", status, e)
 
+    with tempfile.TemporaryDirectory(dir=str(UPLOAD_DIR)) as tmp:
+        tmp_dir = Path(tmp)
         update_status("downloading")
-        suffix = ".mp4"
-        
-        if video_url.startswith("gs://"):
-            logger.info(f"Downloading from GCS: {video_url}")
-            tmp_video_path = await download_from_gcs(video_url, suffix)
-            input_video_gcp_uri = video_url # Already in GCS
-        elif is_youtube_url(video_url):
-            logger.info(f"Processing YouTube URL via external API: {video_url}")
-            # Call external API to process YouTube video and get GCS URL
-            gcs_url = await process_youtube_via_external_api(video_url)
-            # Download the processed video from GCS
-            tmp_video_path = await download_from_gcs(gcs_url, suffix)
-            input_video_gcp_uri = gcs_url # Already in GCS
-        else:
-            logger.info(f"Downloading from HTTP URL: {video_url}")
-            tmp_video_path = await download_to_tmp(video_url, suffix)
-        
-        # Will upload to GCS later
-        
-        # 2. Extract Audio 
-        update_status("extracting_audio")
-        logger.info("Extracting audio...")
-        audio_filename = f"audio_{uid}_{int(time.time())}.mp3"
-        tmp_audio_path = UPLOAD_DIR / audio_filename
-        await asyncio.to_thread(extract_audio_sync, str(tmp_video_path), str(tmp_audio_path))
-        
-        # 3. Upload Audio to GCP 
-        update_status("uploading_audio")
-        logger.info("Uploading audio to GCP...")
-        audio_gcp_url = await upload_to_gcs(tmp_audio_path, audio_filename)
-        logger.info(f"Audio uploaded: {audio_gcp_url}")
 
-        # Ensure Source Video is in GCS for Lambda
-        if not input_video_gcp_uri:
-            update_status("uploading_video")
-            video_filename = f"input_{uid}_{int(time.time())}.mp4"
-            logger.info(f"Uploading source video to GCS for Lambda: {video_filename}")
-            input_video_gcp_uri = await upload_to_gcs(tmp_video_path, video_filename)
-        
-        # 4. Analyze with Gemini (SKIPPED FOR TESTING)
+        # ── 1. Resolve the source. Never fetch arbitrary URLs (SSRF). ──────
+        audio_gcs_uri = None
+        clip_audio_uri = None
+        source_duration = 0.0
+        raw_video_url = project.get("rawVideoUrl") or ""
+
+        if is_youtube_url(video_url):
+            video_gcs_uri, audio_gcs_uri, source_duration = await download_youtube_video_external(video_url)
+            clip_audio_uri = audio_gcs_uri  # downloader video track has no audio
+            v_bucket, v_blob = parse_gs_uri(video_gcs_uri)
+            blob = await asyncio.to_thread(get_storage_client().bucket(v_bucket).get_blob, v_blob)
+            if blob is None:
+                raise PermanentJobError("Downloaded video not found in storage")
+            if (blob.size or 0) > MAX_SOURCE_BYTES:
+                raise PermanentJobError("Source video is too large")
+            if source_duration <= 0:
+                source_duration = await asyncio.to_thread(probe_duration_seconds_gcs, v_bucket, v_blob)
+            source_uri = video_gcs_uri
+        else:
+            # Uploads: the source is the project's own upload, not the caller's URL.
+            source_uri = raw_video_url
+            if not is_allowed_source_uri(source_uri):
+                raise PermanentJobError("Project has no valid uploaded source video")
+            if video_url and video_url != source_uri:
+                log.warning("Ignoring caller-supplied video_url for project %s; using rawVideoUrl", project_id)
+            v_bucket, v_blob = parse_gs_uri(source_uri)
+            # SC-8: size and duration checks BEFORE touching the media.
+            blob = await asyncio.to_thread(get_storage_client().bucket(v_bucket).get_blob, v_blob)
+            if blob is None:
+                raise PermanentJobError("Uploaded video not found in storage")
+            if (blob.size or 0) > MAX_SOURCE_BYTES:
+                raise PermanentJobError(
+                    f"Source video is too large ({blob.size / 1024 ** 3:.1f} GiB, max "
+                    f"{MAX_SOURCE_BYTES / 1024 ** 3:.1f} GiB)"
+                )
+            probed = project.get("probedDurationSeconds")
+            if project.get("probeStatus") == "ready" and isinstance(probed, (int, float)) and probed > 0:
+                source_duration = float(probed)
+            else:
+                source_duration = await asyncio.to_thread(probe_duration_seconds_gcs, v_bucket, v_blob)
+
+        if source_duration <= 0:
+            raise PermanentJobError("Could not determine the source video's duration")
+        if source_duration > MAX_SOURCE_DURATION_SECONDS:
+            raise PermanentJobError(
+                f"Source video is too long ({source_duration / 60:.0f} min, max "
+                f"{MAX_SOURCE_DURATION_SECONDS / 60:.0f} min)"
+            )
+
+        # ── 2. Reserve credits atomically (SC-9 / C7). ─────────────────────
+        minutes = seconds_to_credit_minutes(source_duration)
+        update_status("validating_credits", originalDuration=source_duration, minutesToDeduct=minutes)
+        reserved = await asyncio.to_thread(reserve_magic_minutes, project_id, uid, minutes)
+        log.info("Reserved %.2f magicmins for project %s (%.1fs source)", reserved, project_id, source_duration)
+
+        # ── 3. Audio for transcription. ────────────────────────────────────
+        if audio_gcs_uri is None:
+            existing_audio = project.get("audioUrl")
+            if project.get("audioStatus") == "ready" and is_allowed_source_uri(existing_audio or ""):
+                audio_gcs_uri = existing_audio
+                log.info("Reusing extracted audio %s", audio_gcs_uri)
+            else:
+                update_status("extracting_audio")
+                audio_path = tmp_dir / "audio.mp3"
+                await asyncio.to_thread(extract_audio_from_gcs_sync, v_bucket, v_blob, str(audio_path))
+                update_status("uploading_audio")
+                audio_gcs_uri = await asyncio.to_thread(
+                    upload_to_gcs_sync, audio_path, f"{v_blob}.mp3", "audio/mpeg"
+                )
+
+        # ── 4. Gemini analysis. ────────────────────────────────────────────
         update_status("transcribing")
         viral_clips_meta = await asyncio.to_thread(
-            analyze_audio_with_gemini, 
-            str(tmp_video_path),
-            gcs_audio_uri=audio_gcp_url
+            analyze_audio_with_gemini,
+            "",
+            gcs_audio_uri=audio_gcs_uri,
+            total_duration_seconds=source_duration,
         )
-    
         update_status("finding_clips")
-        
-        if not viral_clips_meta:
-            raise HTTPException(status_code=400, detail="No viral clips found by Gemini.")
-            
-        logger.info(f"Gemini found {len(viral_clips_meta)} clips: {viral_clips_meta}")
+        clips = normalize_clip_windows(viral_clips_meta, source_duration)
+        if not clips:
+            raise PermanentJobError("No viral clips were found in this video")
 
+        # ── 5. Record the run, then publish one job per clip (C7). ─────────
+        for clip in clips:
+            clip["clip_id"] = uuid.uuid4().hex
+        clip_ids = [c["clip_id"] for c in clips]
+        update_status(
+            "processing",
+            totalClips=len(clips),
+            completedClips=0,
+            failedClips=0,
+            failedClipIds=[],
+            clips=[],
+            clipCount=0,
+            expectedClipIds=clip_ids,
+            clipSourceUri=source_uri,
+            clipAudioUri=clip_audio_uri,
+            originalDuration=source_duration,
+            reservedMagicMins=reserved,
+        )
 
-        # 5. Parallel Processing via Cloud Run
-        # Prepare payload for each clip
-        # Extract blob name from GCS URI (gs://bucket/blob...)
-        if input_video_gcp_uri.startswith("gs://"):
-            parts = input_video_gcp_uri[5:].split('/', 1)
-            if len(parts) == 2:
-                input_blob_name = parts[1]
-            else:
-                input_blob_name = ''
-        else:
-            input_blob_name = input_video_gcp_uri
+        publisher = create_clip_publisher()
+        message_ids = await asyncio.to_thread(
+            publisher.publish_clips_batch, clips, source_uri, clip_audio_uri, project_id,
+        )
+        if any(mid is None for mid in message_ids):
+            raise PermanentJobError("Failed to queue clip jobs")
 
-        # Generate signed URL for input video (GET) and use it for both download and Cloud Run
-        storage_client = get_storage_client()
-        bucket = storage_client.bucket(GCP_BUCKET_NAME)
-        def generate_signed_url(blob_name, method="GET"):
-            blob = bucket.blob(blob_name)
-            url = blob.generate_signed_url(
-                version="v4",
-                expiration=timedelta(minutes=15),
-                method=method,
-                content_type="video/mp4" if method == "PUT" else None
-            )
-            return url
-
-        input_signed_url = generate_signed_url(input_blob_name, "GET")
-        # Use input_signed_url for both download (if needed) and for Cloud Run payload
-        cloud_run_clips = []
-        for i, clip_meta in enumerate(viral_clips_meta):
-            start_time = clip_meta.get("start")
-            end_time = clip_meta.get("end")
-            if not start_time or not end_time:
-                continue
-            # Convert SRT time to float seconds if needed
-            if isinstance(start_time, str):
-                start_sec = srt_time_to_seconds(start_time)
-                logger.info(f"Parsed time '{start_time}' -> {start_sec}s")
-            else:
-                start_sec = float(start_time)
-            if isinstance(end_time, str):
-                end_sec = srt_time_to_seconds(end_time)
-                logger.info(f"Parsed time '{end_time}' -> {end_sec}s")
-            else:
-                end_sec = float(end_time)
-            clip_id = f"{uid}_{int(time.time())}_{i}"
-            payload = {
-                "input_signed_url": input_signed_url,
-                "start": start_sec,  # ensure float, not string
-                "end": end_sec,      # ensure float, not string
-                "clip_id": clip_id,
-                "project_id": project_id,
-                "reason": clip_meta.get("reason", ""),
-                "duration": end_sec - start_sec
-            }
-            logger.info(f"Cloud Run payload for clip {i}: {payload}")
-            cloud_run_clips.append(payload)
-
-        update_status("processing_clips_parallel")
-        results = await process_clips_parallel(cloud_run_clips)
-
-        success_count = 0
-        for i, (status, response) in enumerate(results):
-            logger.info(f"Cloud Run response for clip index {i}: status={status}, body={response}")
-            if status == 200 and response.get("Status") == "SUCCEEDED":
-                success_count += 1
-                logger.info(f"Cloud Run success for clip index {i}")
-                payload = cloud_run_clips[i]
-                output_url = extract_output_video_url(response)
-                if not output_url:
-                    inferred = infer_output_url_from_clip_id(payload.get("clip_id"))
-                    if inferred:
-                        output_url = inferred
-                        logger.info(
-                            "Inferred output URL for clip index %d from clip_id: %s",
-                            i,
-                            output_url,
-                        )
-                    else:
-                        logger.warning(f"Could not extract output URL for clip index {i}. Response payload: {response}")
-                else:
-                    logger.info(f"Extracted output URL for clip index {i}: {output_url}")
-                clip_entry = {
-                    "videoUrl": output_url,
-                    "start": payload.get("start"),
-                    "end": payload.get("end"),
-                    "reason": payload.get("reason", ""),
-                    "duration": payload.get("duration", 0),
-                    "processedAt": datetime.utcnow().isoformat(),
-                }
-                generated_clips.append(clip_entry)
-            else:
-                logger.error(f"Cloud Run returned failure: {response}")
-
-        if success_count == 0 and len(viral_clips_meta) > 0:
-            raise HTTPException(status_code=500, detail="Failed to generate any clips via Cloud Run")
-
-        # If Cloud Run writes clips directly to Firestore, use those as fallback
-        # when output URLs were not extracted from HTTP responses.
-        if db:
-            try:
-                has_any_output_url = any(c.get("videoUrl") for c in generated_clips)
-                if not has_any_output_url:
-                    project_snapshot = db.collection("projects").document(project_id).get()
-                    project_data = project_snapshot.to_dict() if project_snapshot.exists else {}
-                    existing_clips = project_data.get("clips", [])
-                    if isinstance(existing_clips, list) and existing_clips:
-                        generated_clips = existing_clips
-                        logger.info(
-                            "Loaded %d existing clips from Firestore fallback for project %s",
-                            len(generated_clips),
-                            project_id,
-                        )
-            except Exception as existing_clip_error:
-                logger.warning(f"Could not load existing clips fallback: {existing_clip_error}")
-
-        # 6. Generate watermark clips (top-right logo overlay) using ffmpeg.
-        if should_generate_watermarked_clips(user_status) and generated_clips:
-            if not LOGO_PATH.exists():
-                logger.error(f"Watermark logo missing at {LOGO_PATH}. Skipping watermark generation.")
-            else:
-                update_status("watermarking")
-                for i, clip in enumerate(generated_clips):
-                    clip_url = clip.get("videoUrl")
-                    if not clip_url:
-                        logger.warning(f"Skipping watermark for clip {i}: output URL missing")
-                        continue
-
-                    local_input = None
-                    local_output = None
-                    try:
-                        if str(clip_url).startswith("gs://"):
-                            local_input = await download_from_gcs(str(clip_url), suffix=".mp4")
-                        elif str(clip_url).startswith(("http://", "https://")):
-                            local_input = await download_to_tmp(str(clip_url), suffix=".mp4")
-                        else:
-                            logger.warning(f"Unsupported clip URL format for watermarking: {clip_url}")
-                            continue
-
-                        local_output = UPLOAD_DIR / f"wm_{project_id}_{uid}_{int(time.time())}_{i}.mp4"
-                        await asyncio.to_thread(
-                            add_logo_watermark_sync,
-                            local_input,
-                            local_output,
-                            LOGO_PATH,
-                            WATERMARK_MARGIN_PX,
-                            WATERMARK_WIDTH_RATIO,
-                        )
-
-                        dest_name = f"watermarked/{project_id}/wm_{uid}_{int(time.time())}_{i}.mp4"
-                        watermark_gcs_url = await upload_to_gcs(local_output, dest_name)
-
-                        watermark_entry = dict(clip)
-                        watermark_entry["videoUrl"] = watermark_gcs_url
-                        watermark_clips.append(watermark_entry)
-                    except Exception as wm_error:
-                        logger.error(f"Watermark generation failed for clip index {i}: {wm_error}")
-                    finally:
-                        if local_input and local_input.exists():
-                            try:
-                                local_input.unlink()
-                            except Exception:
-                                pass
-                        if local_output and local_output.exists():
-                            try:
-                                local_output.unlink()
-                            except Exception:
-                                pass
-            
-        minutes_to_deduct = 0 # SKIPPED FOR TESTING
-        # 7. Final Status Update
-        if db:
-            try:
-                doc_ref = db.collection("projects").document(project_id)
-                doc_ref.update({
-                    "status": "completed",
-                    "completedAt": firestore.SERVER_TIMESTAMP,
-                    "clipCount": len(generated_clips) if generated_clips else success_count,
-                    "clips": generated_clips,
-                    "watermarkclips": watermark_clips,
-                    "watermarkClipCount": len(watermark_clips),
-                    "userStatus": user_status,
-                })
-                logger.info(f"Project {project_id} marked as completed")
-            except Exception as e:
-                logger.error(f"Failed to update final status: {e}")
-        
-        # 8. Debit Minutes (Billing)
-        if minutes_to_deduct > 0 and db:
-            logger.info(f"Debiting {minutes_to_deduct} minutes from user {uid}")
-            try:
-                user_ref = db.collection("users").document(uid)
-                user_doc = user_ref.get()
-                if user_doc.exists:
-                    current_mins = float(user_doc.to_dict().get("videomins", 0.0) or 0.0)
-                    new_balance = max(current_mins - minutes_to_deduct, 0.0)
-                    user_ref.update({"videomins": new_balance, "updatedAt": firestore.SERVER_TIMESTAMP})
-                    logger.info(f"User {uid} new balance: {new_balance}")
-            except Exception as e:
-                logger.error(f"Failed to debit minutes for user {uid}: {e}")
-        
-        logger.info(f"Background processing completed for project {project_id}")
-        
-    except Exception as e:
-        logger.error(f"Background processing failed for project {project_id}: {e}", exc_info=True)
-
-        update_status("failed", error=str(e), failedAt=firestore.SERVER_TIMESTAMP)
-        
-        # Update Firestore with error status
-        if db:
-            try:
-                doc_ref = db.collection("projects").document(project_id)
-                doc_ref.update({
-                    "status": "failed",
-                    "error": str(e),
-                    "failedAt": firestore.SERVER_TIMESTAMP
-                })
-            except Exception as update_error:
-                logger.error(f"Failed to update error status: {update_error}")
-    
-    finally:
-        # Cleanup temp files
-        if tmp_video_path and tmp_video_path.exists():
-            try:
-                tmp_video_path.unlink()
-            except Exception as e:
-                logger.error(f"Failed to cleanup video: {e}")
-        if tmp_audio_path and tmp_audio_path.exists():
-            try:
-                tmp_audio_path.unlink()
-            except Exception as e:
-                logger.error(f"Failed to cleanup audio: {e}")
-
+        _project_ref(project_id).update({
+            "clipsPublishedAt": firestore.SERVER_TIMESTAMP,
+            "queuedClips": len(message_ids),
+            "workerLeaseUntil": 0,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+        log.info("Queued %d clip jobs for project %s", len(clips), project_id)
+        return {"success": True, "projectId": project_id, "queuedClips": len(clips)}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -884,50 +712,43 @@ async def process_viral_clips_background(project_id: str, uid: str, video_url: s
 async def process_viral_clips_worker(
     project_id: str = Body(...),
     uid: str = Body(...),
-    video_url: str = Body(...)
+    video_url: str = Body(""),
+    x_internal_token: str | None = Header(None),
 ):
-    """Worker endpoint called by Cloud Tasks. No auth required - uses service account."""
-    logger.info(f"Worker started for project {project_id}")
-    
-    await process_viral_clips_background(project_id, uid, video_url)
-    
-    return {"success": True, "projectId": project_id}
+    """Cloud Tasks worker.
 
+    Auth: Cloud Run IAM (OIDC token from the backend's Cloud Task) plus the
+    optional X-Internal-Token check (contract C1).
+    Status codes: 2xx = done (including handled failures, so Cloud Tasks does not
+    retry a permanent error); 409 = another attempt is still running, retry later;
+    5xx = transient, retry.
+    """
+    verify_internal_token(x_internal_token)
+    if not PROJECT_ID_RE.fullmatch(project_id or "") or not UID_RE.fullmatch(uid or ""):
+        raise HTTPException(status_code=400, detail="Invalid project_id or uid")
 
-# @app.post("/api/generate-viral-clips")
-# async def generate_viral_clips(
-#     request: ViralClipRequest,
-#     user = Depends(verify_firebase_token)
-# ):
-#     uid = user["uid"]
-#     video_url = request.videoUrl.strip()
-
-#     logger.info(f"[user:{uid}] New viral clips request → {video_url}")
-
-#     # Create processing document
-#     doc_ref = db.collection("magi-clips").document()
-#     project_id = doc_ref.id
-
-#     doc_ref.set({
-#         "uid": uid,
-#         "originalVideoUrl": video_url,
-#         "status": "processing",
-#         "createdAt": firestore.SERVER_TIMESTAMP,
-#         "clips": [],
-#         "clipCount": 0
-#     }, merge=True)
-
-#     # Start background task
-#     asyncio.create_task(
-#         process_viral_clips_background(project_id, uid, video_url)
-#     )
-
-#     return {
-#         "success": True,
-#         "projectId": project_id,
-#         "status": "processing",
-#         "message": "Viral clip generation started"
-#     }
+    attempt_id = uuid.uuid4().hex
+    logger.info("Worker attempt %s started for project %s", attempt_id, project_id)
+    try:
+        return await run_viral_clips_job(project_id, uid, (video_url or "").strip(), attempt_id)
+    except WorkerBusy:
+        return JSONResponse(status_code=409, content={"detail": "Another attempt is running"})
+    except ClaimRejected as e:
+        # Never write to a project the caller does not own; ack so the task is not retried.
+        logger.warning("Rejected task for project %s: %s", project_id, e)
+        return {"success": False, "projectId": project_id, "error": str(e)}
+    except PermanentJobError as e:
+        logger.warning("Project %s failed permanently: %s", project_id, e)
+        await asyncio.to_thread(fail_project_and_refund, project_id, uid, str(e), attempt_id)
+        return {"success": False, "projectId": project_id, "error": str(e)}
+    except Exception as e:
+        # Unexpected errors are terminal for this run too (refund + failed);
+        # retrying a half-done Gemini/publish step would only duplicate work.
+        logger.error("Worker failed for project %s: %s", project_id, e, exc_info=True)
+        await asyncio.to_thread(
+            fail_project_and_refund, project_id, uid, "Smart Clips processing failed. Please try again.", attempt_id
+        )
+        return {"success": False, "projectId": project_id, "error": "internal error"}
 
 
 @app.get("/health")
@@ -937,9 +758,4 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "app:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 8080)),
-        reload=True
-    )
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 8080)), reload=True)

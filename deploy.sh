@@ -24,19 +24,40 @@ gcloud builds submit \
   --project=${PROJECT_ID} \
   --timeout=30m
 
-# Deploy to Cloud Run with L4 GPU
+# Deploy to Cloud Run.
+# - IAM-only (contract C1 / SEC-4): only the Cloud Tasks invoker SA may call it.
+#   Grant it once:
+#     gcloud run services add-iam-policy-binding ${SERVICE_NAME} --region ${REGION} \
+#       --member="serviceAccount:${TASKS_INVOKER_SA}" --role=roles/run.invoker --project=${PROJECT_ID}
+# - SC-8: concurrency 1 and a 30 min request timeout. The backend must create the
+#   Cloud Task with dispatch_deadline=1800s (queue: viral-clips-queue, max attempts ~3).
+#   A retry that arrives while the first attempt still holds its lease gets 409 and
+#   is retried later; completed/published runs are acked as duplicates.
+# - SEC-1: no key files. The runtime SA (RUNTIME_SA) needs: roles/datastore.user on
+#   the Firebase project caps-85254, storage object read/write on subtitlegen-input,
+#   roles/pubsub.publisher on clip-processing-jobs, roles/aiplatform.user, and
+#   roles/run.invoker on the Whisper service. INTERNAL_API_TOKEN comes from Secret Manager.
+#   Set RUNTIME_SA=<sa email> and INTERNAL_TOKEN_SECRET=<secret name> before running;
+#   both flags are skipped when unset so the deploy still works before they exist.
+EXTRA_FLAGS=()
+[ -n "${RUNTIME_SA:-}" ] && EXTRA_FLAGS+=(--service-account "${RUNTIME_SA}")
+[ -n "${INTERNAL_TOKEN_SECRET:-}" ] && EXTRA_FLAGS+=(--update-secrets "INTERNAL_API_TOKEN=${INTERNAL_TOKEN_SECRET}:latest")
 echo "Deploying to Cloud Run .."
 gcloud run deploy ${SERVICE_NAME} \
   --image ${IMAGE_NAME} \
   --region ${REGION} \
   --platform managed \
-  --memory 16Gi \
-  --cpu 8 \
-  --timeout 900 \
-  --concurrency 2 \
+  --memory 2Gi \
+  --cpu 2 \
+  --timeout 1800 \
+  --concurrency 1 \
   --max-instances 3 \
   --min-instances 0 \
-  --allow-unauthenticated 
+  --no-allow-unauthenticated \
+  "${EXTRA_FLAGS[@]}" \
+  --update-env-vars "GCP_PROJECT_ID=${PROJECT_ID},FIREBASE_PROJECT_ID=caps-85254,GCP_BUCKET_NAME=subtitlegen-input,ALLOWED_INPUT_BUCKETS=subtitlegen-input,CLIP_TOPIC=clip-processing-jobs,YOUTUBE_DOWNLOADER_BUCKET=subtitlegen-input,YOUTUBE_DOWNLOADER_PREFIX=youtube_downloads/"
+# Also set (not hard-coded here): WHISPER_SERVICE_URL=https://<whisper service>.run.app,
+# YOUTUBE_DOWNLOADER_URL=https://<downloader host>/download (HTTPS; see SEC-11 note).
 
 echo "Deployment complete!"
 echo "Service URL:"

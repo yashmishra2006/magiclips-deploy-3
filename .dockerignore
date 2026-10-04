@@ -1,0 +1,12 @@
+.git/
+__pycache__/
+*.py[cod]
+*.log
+tmp_uploads/
+*.mp4
+*.mp3
+venv/
+.venv/
+test*.py
+tests/
+*.md
