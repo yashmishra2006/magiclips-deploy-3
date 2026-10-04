@@ -24,8 +24,14 @@ def verify_internal_token(x_internal_token: str | None) -> None:
 
 
 def audience_for(url: str) -> str:
+    """ID-token audience: the service URL. A traffic-tag URL
+    (https://<tag>---<service>-<hash>.run.app) isn't a valid audience, so the
+    tag is stripped."""
     parsed = urlparse(url)
-    return f"{parsed.scheme}://{parsed.netloc}"
+    host = parsed.netloc
+    if host.endswith(".run.app") and "---" in host:
+        host = host.split("---", 1)[1]
+    return f"{parsed.scheme}://{host}"
 
 
 def internal_auth_headers(url: str) -> dict:
