@@ -7,10 +7,13 @@ Publishes clip processing jobs to Pub/Sub topic for asynchronous processing.
 import json
 import logging
 import os
+import time
 from typing import List, Dict, Optional
 from concurrent import futures
 
 from google.cloud import pubsub_v1
+
+import obs
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +37,7 @@ class ClipJobPublisher:
         self.publisher = pubsub_v1.PublisherClient()
         self.topic_path = self.publisher.topic_path(self.project_id, self.topic_name)
 
-        logger.info(f"Initialized Pub/Sub publisher for topic: {self.topic_path}")
+        logger.debug("Initialized Pub/Sub publisher for topic: %s", self.topic_path)
 
     def _publish(self, message_data: Dict) -> futures.Future:
         message_bytes = json.dumps(message_data).encode("utf-8")
@@ -44,6 +47,8 @@ class ClipJobPublisher:
             clip_id=message_data["clip_id"],
             project_id=message_data["project_id"],
             type="clip_processing",
+            # Correlation: the consumer reads attribute `request_id` back (obs convention).
+            **obs.pubsub_attributes(),
         )
 
     def publish_clips_batch(
@@ -65,6 +70,7 @@ class ClipJobPublisher:
         if not isinstance(input_gcs_uri, str) or not input_gcs_uri.startswith("gs://"):
             raise ValueError("input_gcs_uri must be a gs:// URI")
 
+        started = time.perf_counter()
         publish_futures = []
         for clip_meta in clips:
             message_data = {
@@ -84,12 +90,20 @@ class ClipJobPublisher:
             try:
                 message_ids.append(future.result(timeout=60))
             except Exception as e:
-                logger.error(f"Error publishing message: {e}")
+                logger.error("Error publishing message: %s", e)
                 message_ids.append(None)
 
         successful = len([mid for mid in message_ids if mid is not None])
-        logger.info(
-            f"Published {successful}/{len(clips)} clip jobs to Pub/Sub for project {project_id}"
+        failed = len(message_ids) - successful
+        obs.log_event(
+            "pubsub_publish_done",
+            logging.WARNING if failed else logging.INFO,
+            f"Published {successful}/{len(clips)} clip jobs to Pub/Sub for project {project_id}",
+            topic=self.topic_name,
+            messages=successful,
+            failed=failed,
+            duration_ms=obs.ms_since(started),
+            status="ok" if not failed else "partial" if successful else "error",
         )
         return message_ids
 
