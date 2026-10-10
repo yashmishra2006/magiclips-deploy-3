@@ -27,6 +27,7 @@ from firebase_admin import credentials, firestore
 from gemini_analysis import analyze_audio_with_gemini
 from internal_auth import verify_internal_token, internal_auth_headers
 from pubsub_publisher import create_clip_publisher
+import obs
 
 
 # ──────────────────────────────────────────────────────────────
@@ -35,10 +36,8 @@ from pubsub_publisher import create_clip_publisher
 
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)-7s | %(name)-18s | %(message)s'
-)
+# Structured JSON logs (Cloud Logging); level from LOG_LEVEL (default INFO).
+obs.setup_logging("magi-clips")
 logger = logging.getLogger("capsai.main")
 
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./tmp_uploads"))
@@ -119,7 +118,19 @@ def get_storage_client():
 def upload_to_gcs_sync(local_path: Path, dest_name: str, content_type: str | None = None) -> str:
     bucket = get_storage_client().bucket(GCP_BUCKET_NAME)
     blob = bucket.blob(dest_name)
-    blob.upload_from_filename(str(local_path), content_type=content_type)
+    started = time.perf_counter()
+    status = "error"
+    try:
+        blob.upload_from_filename(str(local_path), content_type=content_type)
+        status = "ok"
+    finally:
+        try:
+            nbytes = Path(local_path).stat().st_size
+        except OSError:
+            nbytes = None
+        obs.storage_event("gcs", "upload", GCP_BUCKET_NAME, dest_name, nbytes,
+                          obs.ms_since(started), status=status, via="sdk",
+                          level=logging.INFO if status == "ok" else logging.WARNING)
     return f"gs://{bucket.name}/{dest_name}"
 
 
@@ -174,10 +185,19 @@ def probe_duration_seconds_gcs(bucket: str, blob: str) -> float:
     http_args, url = gcs_http_input(bucket, blob)
     cmd = ["ffprobe", "-v", "error", *http_args,
            "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", url]
+    # ffprobe range-reads the container header over HTTPS (bytes read unknown).
+    started = time.perf_counter()
+    status = "error"
     try:
         probe = subprocess.run(cmd, capture_output=True, text=True, timeout=FFPROBE_TIMEOUT_SECONDS)
+        status = "ok" if probe.returncode == 0 else "error"
     except subprocess.TimeoutExpired:
+        status = "timeout"
         raise PermanentJobError("Timed out reading the source video's duration")
+    finally:
+        obs.storage_event("gcs", "download", bucket, blob, None, obs.ms_since(started),
+                          range_read=True, status=status, via="ffprobe_http",
+                          level=logging.INFO if status == "ok" else logging.WARNING)
     if probe.returncode != 0:
         raise PermanentJobError("Could not read the source video (ffprobe failed)")
     try:
@@ -187,8 +207,12 @@ def probe_duration_seconds_gcs(bucket: str, blob: str) -> float:
     return value if math.isfinite(value) and value > 0 else 0.0
 
 
-def extract_audio_from_gcs_sync(bucket: str, blob: str, audio_path: str) -> str:
-    """Stream the source from GCS and extract mono MP3 audio (no full video download)."""
+def extract_audio_from_gcs_sync(bucket: str, blob: str, audio_path: str,
+                                source_bytes: int | None = None, media_seconds: float | None = None) -> str:
+    """Stream the source from GCS and extract mono MP3 audio (no full video download).
+
+    source_bytes / media_seconds only feed the cost log lines.
+    """
     http_args, url = gcs_http_input(bucket, blob)
     cmd = [
         "ffmpeg", "-y", "-nostdin", "-v", "error",
@@ -202,11 +226,28 @@ def extract_audio_from_gcs_sync(bucket: str, blob: str, audio_path: str) -> str:
         "-c:a", "libmp3lame", "-q:a", "2",
         audio_path,
     ]
+    started = time.perf_counter()
+    status = "error"
     try:
         result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                 text=True, timeout=AUDIO_EXTRACT_TIMEOUT_SECONDS)
+        status = "ok" if result.returncode == 0 else "error"
     except subprocess.TimeoutExpired:
+        status = "timeout"
         raise PermanentJobError("Audio extraction timed out")
+    finally:
+        duration_ms = obs.ms_since(started)
+        try:
+            output_bytes = Path(audio_path).stat().st_size
+        except OSError:
+            output_bytes = None
+        # ffmpeg streams (≈ the whole object, audio is interleaved) from GCS over HTTPS.
+        obs.storage_event("gcs", "download", bucket, blob, source_bytes, duration_ms,
+                          status=status, via="ffmpeg_http", bytes_estimated=True,
+                          level=logging.INFO if status == "ok" else logging.WARNING)
+        obs.log_event("ffmpeg_done", logging.INFO if status == "ok" else logging.WARNING,
+                      step="extract_audio", input_bytes=source_bytes, output_bytes=output_bytes,
+                      media_seconds=media_seconds, duration_ms=duration_ms, status=status)
     if result.returncode != 0:
         stderr = (result.stderr or "")[-600:]
         if "matches no streams" in stderr or "Stream map" in stderr:
@@ -265,12 +306,21 @@ async def download_youtube_video_external(youtube_url: str) -> tuple[str, str, f
     """
     downloader_url = youtube_downloader_url()
     headers = await asyncio.to_thread(internal_auth_headers, downloader_url)
-    logger.info("Calling YouTube downloader for %s", youtube_url)
+    match = YOUTUBE_REGEX.search(youtube_url)
+    logger.info("Calling YouTube downloader for video %s", match.group(1) if match else "?")
+    headers = {**obs.outbound_headers(), **headers}
+    started = time.perf_counter()
+    call_status: int | str = "error"
     try:
         async with httpx.AsyncClient(timeout=600.0, follow_redirects=False) as client:
             response = await client.post(downloader_url, json={"url": youtube_url}, headers=headers)
+        call_status = response.status_code
     except httpx.HTTPError as e:
         raise PermanentJobError(f"YouTube downloader unreachable: {e}")
+    finally:
+        obs.log_event("outbound_call_done", target="yt-downloader", method="POST",
+                      path=urlparse(downloader_url).path, status=call_status,
+                      duration_ms=obs.ms_since(started), attempt=1)
     if response.status_code >= 400:
         raise PermanentJobError(f"YouTube download failed (HTTP {response.status_code})")
     try:
@@ -549,6 +599,7 @@ app = FastAPI(
     description="Internal Cloud Tasks worker: analyses a source and queues per-clip jobs",
     version="0.2.0",
 )
+app.add_middleware(obs.RequestContextMiddleware)
 
 
 class WorkerBusy(Exception):
@@ -565,8 +616,10 @@ async def run_viral_clips_job(project_id: str, uid: str, video_url: str, attempt
     decision, project = await asyncio.to_thread(claim_project, project_id, uid, attempt_id)
     if decision == "noop":
         log.info("Project %s already processed/published; acking duplicate task", project_id)
+        obs.log_event("job_duplicate_skipped", job_type="viral_clips", reason="already_processed")
         return {"success": True, "projectId": project_id, "duplicate": True}
     if decision == "busy":
+        obs.log_event("job_duplicate_skipped", logging.WARNING, job_type="viral_clips", reason="lease_held")
         raise WorkerBusy()
 
     def update_status(status: str, **extra):
@@ -649,7 +702,10 @@ async def run_viral_clips_job(project_id: str, uid: str, video_url: str, attempt
             else:
                 update_status("extracting_audio")
                 audio_path = tmp_dir / "audio.mp3"
-                await asyncio.to_thread(extract_audio_from_gcs_sync, v_bucket, v_blob, str(audio_path))
+                await asyncio.to_thread(
+                    extract_audio_from_gcs_sync, v_bucket, v_blob, str(audio_path),
+                    getattr(blob, "size", None), source_duration,
+                )
                 update_status("uploading_audio")
                 audio_gcs_uri = await asyncio.to_thread(
                     upload_to_gcs_sync, audio_path, f"{v_blob}.mp3", "audio/mpeg"
@@ -701,6 +757,7 @@ async def run_viral_clips_job(project_id: str, uid: str, video_url: str, attempt
             "updatedAt": firestore.SERVER_TIMESTAMP,
         })
         log.info("Queued %d clip jobs for project %s", len(clips), project_id)
+        obs.bind(clips=len(clips), source_seconds=round(source_duration, 1))
         return {"success": True, "projectId": project_id, "queuedClips": len(clips)}
 
 
@@ -714,6 +771,8 @@ async def process_viral_clips_worker(
     uid: str = Body(...),
     video_url: str = Body(""),
     x_internal_token: str | None = Header(None),
+    x_cloudtasks_taskretrycount: str | None = Header(None),
+    x_cloudtasks_taskexecutioncount: str | None = Header(None),
 ):
     """Cloud Tasks worker.
 
@@ -728,27 +787,54 @@ async def process_viral_clips_worker(
         raise HTTPException(status_code=400, detail="Invalid project_id or uid")
 
     attempt_id = uuid.uuid4().hex
-    logger.info("Worker attempt %s started for project %s", attempt_id, project_id)
+    attempt = _cloud_tasks_attempt(x_cloudtasks_taskretrycount)
+    obs.bind(job_id=attempt_id, project_id=project_id)
+    job = {"job_type": "viral_clips", "attempt": attempt}
+    if x_cloudtasks_taskexecutioncount is not None:
+        job["execution_count"] = x_cloudtasks_taskexecutioncount
+    obs.log_event("job_started", **job)
+    if attempt > 1:
+        obs.log_event("job_retry", logging.WARNING, reason="cloud_tasks_retry", **job)
+    started = time.perf_counter()
     try:
-        return await run_viral_clips_job(project_id, uid, (video_url or "").strip(), attempt_id)
+        result = await run_viral_clips_job(project_id, uid, (video_url or "").strip(), attempt_id)
+        ctx = obs.get_context()
+        obs.log_event("job_done", duration_ms=obs.ms_since(started), status="duplicate" if result.get("duplicate") else "ok",
+                      clips=ctx.get("clips"), source_seconds=ctx.get("source_seconds"), **job)
+        return result
     except WorkerBusy:
+        # job_duplicate_skipped(reason=lease_held) already logged; Cloud Tasks retries on 409.
         return JSONResponse(status_code=409, content={"detail": "Another attempt is running"})
     except ClaimRejected as e:
         # Never write to a project the caller does not own; ack so the task is not retried.
         logger.warning("Rejected task for project %s: %s", project_id, e)
+        obs.log_event("job_failed", logging.WARNING, reason="claim_rejected", status="rejected",
+                      duration_ms=obs.ms_since(started), **job)
         return {"success": False, "projectId": project_id, "error": str(e)}
     except PermanentJobError as e:
         logger.warning("Project %s failed permanently: %s", project_id, e)
+        obs.log_event("job_failed", logging.WARNING, reason="permanent_error", status="failed",
+                      error=type(e).__name__, duration_ms=obs.ms_since(started), **job)
         await asyncio.to_thread(fail_project_and_refund, project_id, uid, str(e), attempt_id)
         return {"success": False, "projectId": project_id, "error": str(e)}
     except Exception as e:
         # Unexpected errors are terminal for this run too (refund + failed);
         # retrying a half-done Gemini/publish step would only duplicate work.
         logger.error("Worker failed for project %s: %s", project_id, e, exc_info=True)
+        obs.log_event("job_failed", logging.ERROR, reason="internal_error", status="failed",
+                      error=type(e).__name__, duration_ms=obs.ms_since(started), **job)
         await asyncio.to_thread(
             fail_project_and_refund, project_id, uid, "Smart Clips processing failed. Please try again.", attempt_id
         )
         return {"success": False, "projectId": project_id, "error": "internal error"}
+
+
+def _cloud_tasks_attempt(retry_count: str | None) -> int:
+    """1-based delivery attempt from X-CloudTasks-TaskRetryCount (1 when absent)."""
+    try:
+        return max(0, int(retry_count or 0)) + 1
+    except ValueError:
+        return 1
 
 
 @app.get("/health")
